@@ -1,0 +1,4 @@
+# Library crate: default to the target chip architecture build
+# (thumbv7em-none-eabihf, AT32F435 = Cortex-M4F)
+[build]
+target = "thumbv7em-none-eabihf"

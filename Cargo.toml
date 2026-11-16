@@ -1,0 +1,46 @@
+[package]
+name = "at32f435-hal"
+version = "0.1.0"
+edition = "2021"
+description = "Embassy-style HAL for the Artery AT32F435 (Cortex-M4F), modeled after ch32-hal"
+license = "MIT"
+rust-version = "1.82"
+
+[dependencies]
+at32f4xx-pac = { version = "0.4", features = ["at32f435"] }
+embassy-hal-internal = "0.5"
+embassy-sync = "0.8"
+embassy-usb-driver = { version = "0.2", optional = true }
+embassy-usb-synopsys-otg = { version = "0.4", optional = true }
+embassy-time-driver = { version = "0.2", optional = true }
+embassy-time-queue-utils = { version = "0.3", optional = true }
+critical-section = "1"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+embedded-hal = "1.0"
+embedded-hal-nb = "1.0"
+
+[dependencies.cortex-m-rt]
+version = "0.7"
+optional = true
+
+[features]
+default = ["embassy", "rt", "exti", "time-driver-systick"]
+# embassy integration: time driver + queues (the app brings embassy-time itself and picks a generic-queue-N)
+embassy = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
+# rt: cortex-m-rt (entry/vector table + #[interrupt]/#[exception] macros)
+rt = ["dep:cortex-m-rt"]
+# exti: built-in EXINT driver; the 7 EXINT vector handlers are owned by the HAL; disable it to bind_interrupts yourself
+exti = []
+# usb: OTGFS1/OTGFS2 device driver (the embassy-usb-driver stack comes from embassy-usb-synopsys-otg)
+usb = ["dep:embassy-usb-synopsys-otg", "dep:embassy-usb-driver"]
+# defmt: pass-through to embassy-hal-internal (Format derives for peripheral singletons/pin types)
+defmt = ["embassy-hal-internal/defmt", "embassy-usb-synopsys-otg?/defmt"]
+# embassy time driver choice (mutually exclusive; the embassy feature requires exactly one)
+time-driver-systick = []
+time-driver-tim2 = []
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
