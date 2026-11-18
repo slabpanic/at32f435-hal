@@ -4,16 +4,37 @@
 //! - [`GeneralInstance`]: timer instance trait; `PwmRegs` abstracts over the
 //!   width difference between the TMR2/5 (32-bit) and TMR3/4 (16-bit)
 //!   register blocks.
-//! - [`simple_pwm::SimplePwm`] / [`simple_pwm::PwmPin`]: PWM output
+//! - [`SimplePwm`] / [`PwmPin`]: PWM output
 //!   (`PwmPin::new_ch1(p.PA0)` -> `SimplePwm::new(p.TMR2, Some(ch1), .., freq)`).
 //!
-//! The advanced timers TMR1/8/20 (which need the POEN master-output enable)
-//! and the 2-channel timers TMR9..14 are not covered yet.
+//! - [`TimerBase`]: TMR6/7 time base (overflow IRQ + async wait)
+//! - [`InputCapture`] / [`OnePulse`] / [`Qei`]:
+//!   capture, single-pulse and encoder counting on TMR2-5
+//! - [`ComplementaryPwm`]: TMR1/8/20 complementary outputs with
+//!   dead time, brake (software + input) and the repetition counter
+//!
+//! PWM also supports the one- and two-channel TMR9 through TMR14.
+//! The infrared timer is in [`crate::irtmr`].
 
+mod advanced;
+mod base;
+mod general;
+mod low_level;
 mod simple_pwm;
 
 use crate::peripheral::RccPeripheral;
+use low_level::PwmRegs;
 
+pub use advanced::{
+    AdvancedBrkPin, AdvancedCh1CPin, AdvancedCh1Pin, AdvancedCh2CPin, AdvancedCh2Pin,
+    AdvancedCh3CPin, AdvancedCh3Pin, AdvancedCh4Pin, AdvancedInstance, BrakeConfig,
+    ComplementaryChannel, ComplementaryPwm,
+};
+pub use base::{InterruptHandler as BaseInterruptHandler, TimerBase};
+pub use general::{
+    CaptureConfig, CaptureError, CaptureInstance, Edge, EventDivider, Filter, InputCapture,
+    InterruptHandler as GeneralInterruptHandler, OnePulse, Qei,
+};
 pub use simple_pwm::{Polarity, PwmPin, SimplePwm};
 
 /// Timer channel.
@@ -35,315 +56,6 @@ impl Channel {
             Channel::Ch3 => 2,
             Channel::Ch4 => 3,
         }
-    }
-}
-
-/// Register-block access abstraction: smooths over the width difference
-/// between TMR2/5 (32-bit) and TMR3/4 (16-bit).
-///
-/// All methods are thin register-level wrappers; the driver layer only deals
-/// with u32/u16 semantic interfaces.
-pub(crate) trait PwmRegs {
-    /// Prescaler (DIV, writing 0 means no division).
-    fn set_div(&self, v: u16);
-    /// Period reload value (PR).
-    fn set_pr(&self, v: u32);
-    /// Read back the period reload value.
-    fn read_pr(&self) -> u32;
-    /// Write the channel compare value (CDT).
-    fn write_cdt(&self, ch: Channel, v: u32);
-    /// Software-generate the overflow event (loads the shadow registers,
-    /// equivalent to STM32's UG).
-    fn swevt_ovf(&self);
-    /// Counter enable (CTRL1.TMREN).
-    fn set_tmren(&self, en: bool);
-    /// Period preload enable (CTRL1.PRBEN).
-    fn set_prben(&self, en: bool);
-    /// Configure the channel for PWM output: direction=output, output control
-    /// = PWM mode (0b110=PWM1 / 0b111=PWM2), compare preload (OBEN) enabled.
-    ///
-    /// WARNING: OSEN (output channel switch) must stay at its reset value 0.
-    /// Setting it disconnects the channel output entirely (all three channels
-    /// went dead on hardware; the official library never sets it either).
-    fn set_pwm_channel(&self, ch: Channel, octrl_bits: u8);
-    /// Channel enable (CCTRL.CEN).
-    fn set_cen(&self, ch: Channel, en: bool);
-    /// Channel polarity (CCTRL.CP: false = active high, true = active low).
-    fn set_cp(&self, ch: Channel, active_low: bool);
-    /// 32-bit counting mode (CTRL1.PMEN, only present on TMR2/5; TMR3/4 have
-    /// no such bit, empty impl).
-    fn set_pmen(&self, en: bool);
-    /// Clear the overflow flag (gets set after a software-generated update event).
-    fn clear_ovf_flag(&self);
-}
-
-impl PwmRegs for crate::pac::tmr2::RegisterBlock {
-    #[inline]
-    fn set_pmen(&self, en: bool) {
-        self.ctrl1().modify(|_, w| {
-            if en {
-                w.pmen().set_bit();
-            } else {
-                w.pmen().clear_bit();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn clear_ovf_flag(&self) {
-        self.ists().write(|w| w.ovfif().clear());
-    }
-
-    #[inline]
-    fn set_div(&self, v: u16) {
-        self.div().write(|w| w.set(v));
-    }
-
-    #[inline]
-    fn set_pr(&self, v: u32) {
-        self.pr().write(|w| w.set(v));
-    }
-
-    #[inline]
-    fn read_pr(&self) -> u32 {
-        self.pr().read().bits()
-    }
-
-    #[inline]
-    fn write_cdt(&self, ch: Channel, v: u32) {
-        match ch {
-            Channel::Ch1 => self.c1dt().write(|w| w.set(v)),
-            Channel::Ch2 => self.c2dt().write(|w| w.set(v)),
-            Channel::Ch3 => self.c3dt().write(|w| w.set(v)),
-            Channel::Ch4 => self.c4dt().write(|w| w.set(v)),
-        };
-    }
-
-    #[inline]
-    fn swevt_ovf(&self) {
-        self.swevt().write(|w| w.ovfswtr().overflow());
-    }
-
-    #[inline]
-    fn set_tmren(&self, en: bool) {
-        self.ctrl1().modify(|_, w| {
-            if en {
-                w.tmren().enable();
-            } else {
-                w.tmren().disable();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn set_prben(&self, en: bool) {
-        self.ctrl1().modify(|_, w| {
-            if en {
-                w.prben().enable();
-            } else {
-                w.prben().disable();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn set_pwm_channel(&self, ch: Channel, octrl_bits: u8) {
-        match ch {
-            Channel::Ch1 => self.cm1_output().modify(|_, w| {
-                w.c1c().output();
-                unsafe {
-                    w.c1octrl().bits(octrl_bits);
-                }
-                w.c1oben().enable();
-                w
-            }),
-            Channel::Ch2 => self.cm1_output().modify(|_, w| {
-                w.c2c().output();
-                unsafe {
-                    w.c2octrl().bits(octrl_bits);
-                }
-                w.c2oben().enable();
-                w
-            }),
-            Channel::Ch3 => self.cm2_output().modify(|_, w| {
-                w.c3c().output();
-                unsafe {
-                    w.c3octrl().bits(octrl_bits);
-                }
-                w.c3oben().enable();
-                w
-            }),
-            Channel::Ch4 => self.cm2_output().modify(|_, w| {
-                w.c4c().output();
-                unsafe {
-                    w.c4octrl().bits(octrl_bits);
-                }
-                w.c4oben().enable();
-                w
-            }),
-        };
-    }
-
-    #[inline]
-    fn set_cen(&self, ch: Channel, en: bool) {
-        let n = ch.index() as u8;
-        self.cctrl().modify(|_, w| {
-            if en {
-                w.cen(n).enable();
-            } else {
-                w.cen(n).disable();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn set_cp(&self, ch: Channel, active_low: bool) {
-        let n = ch.index() as u8;
-        self.cctrl().modify(|_, w| {
-            if active_low {
-                w.cp(n).set_bit();
-            } else {
-                w.cp(n).clear_bit();
-            }
-            w
-        });
-    }
-}
-
-impl PwmRegs for crate::pac::tmr3::RegisterBlock {
-    // 16-bit register block: same shape as above; the width truncates at the
-    // write site (the driver layer guarantees the value range)
-
-    #[inline]
-    fn set_pmen(&self, _en: bool) {
-        // TMR3/4 have no PMEN bit (always 16-bit counting)
-    }
-
-    #[inline]
-    fn clear_ovf_flag(&self) {
-        self.ists().write(|w| w.ovfif().clear());
-    }
-
-    #[inline]
-    fn set_div(&self, v: u16) {
-        self.div().write(|w| w.set(v));
-    }
-
-    #[inline]
-    fn set_pr(&self, v: u32) {
-        self.pr().write(|w| w.set(v as u16));
-    }
-
-    #[inline]
-    fn read_pr(&self) -> u32 {
-        self.pr().read().bits() as u32
-    }
-
-    #[inline]
-    fn write_cdt(&self, ch: Channel, v: u32) {
-        match ch {
-            Channel::Ch1 => self.c1dt().write(|w| w.set(v as u16)),
-            Channel::Ch2 => self.c2dt().write(|w| w.set(v as u16)),
-            Channel::Ch3 => self.c3dt().write(|w| w.set(v as u16)),
-            Channel::Ch4 => self.c4dt().write(|w| w.set(v as u16)),
-        };
-    }
-
-    #[inline]
-    fn swevt_ovf(&self) {
-        self.swevt().write(|w| w.ovfswtr().overflow());
-    }
-
-    #[inline]
-    fn set_tmren(&self, en: bool) {
-        self.ctrl1().modify(|_, w| {
-            if en {
-                w.tmren().enable();
-            } else {
-                w.tmren().disable();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn set_prben(&self, en: bool) {
-        self.ctrl1().modify(|_, w| {
-            if en {
-                w.prben().enable();
-            } else {
-                w.prben().disable();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn set_pwm_channel(&self, ch: Channel, octrl_bits: u8) {
-        match ch {
-            Channel::Ch1 => self.cm1_output().modify(|_, w| {
-                w.c1c().output();
-                unsafe {
-                    w.c1octrl().bits(octrl_bits);
-                }
-                w.c1oben().enable();
-                w
-            }),
-            Channel::Ch2 => self.cm1_output().modify(|_, w| {
-                w.c2c().output();
-                unsafe {
-                    w.c2octrl().bits(octrl_bits);
-                }
-                w.c2oben().enable();
-                w
-            }),
-            Channel::Ch3 => self.cm2_output().modify(|_, w| {
-                w.c3c().output();
-                unsafe {
-                    w.c3octrl().bits(octrl_bits);
-                }
-                w.c3oben().enable();
-                w
-            }),
-            Channel::Ch4 => self.cm2_output().modify(|_, w| {
-                w.c4c().output();
-                unsafe {
-                    w.c4octrl().bits(octrl_bits);
-                }
-                w.c4oben().enable();
-                w
-            }),
-        };
-    }
-
-    #[inline]
-    fn set_cen(&self, ch: Channel, en: bool) {
-        let n = ch.index() as u8;
-        self.cctrl().modify(|_, w| {
-            if en {
-                w.cen(n).enable();
-            } else {
-                w.cen(n).disable();
-            }
-            w
-        });
-    }
-
-    #[inline]
-    fn set_cp(&self, ch: Channel, active_low: bool) {
-        let n = ch.index() as u8;
-        self.cctrl().modify(|_, w| {
-            if active_low {
-                w.cp(n).set_bit();
-            } else {
-                w.cp(n).clear_bit();
-            }
-            w
-        });
     }
 }
 
@@ -375,10 +87,17 @@ macro_rules! impl_general_timer {
     };
 }
 
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 impl_general_timer!(TMR2, tmr2, 32);
 impl_general_timer!(TMR5, tmr2, 32);
 impl_general_timer!(TMR3, tmr3, 16);
 impl_general_timer!(TMR4, tmr3, 16);
+impl_general_timer!(TMR9, tmr9, 16);
+impl_general_timer!(TMR12, tmr9, 16);
+impl_general_timer!(TMR10, tmr10, 16);
+impl_general_timer!(TMR11, tmr10, 16);
+impl_general_timer!(TMR13, tmr10, 16);
+impl_general_timer!(TMR14, tmr10, 16);
 
 crate::pin_trait!(Channel1Pin, GeneralInstance);
 crate::pin_trait!(Channel2Pin, GeneralInstance);
@@ -388,13 +107,21 @@ crate::pin_trait!(Channel4Pin, GeneralInstance);
 // AF numbers: mux1 = TMR1/TMR2 family, mux2 = TMR3/4/5 family
 // ([V] checked against Artery's official examples; [I] = DS function table +
 // STM32 family-pattern inference)
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR2, PA0, 1); // [V] encoder_tmr2 example
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR2, PA15, 1); // [I]
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel2Pin, TMR2, PA1, 1); // [V]
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel2Pin, TMR2, PB3, 1); // [V] DS function table
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel3Pin, TMR2, PA2, 1); // [I]
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel3Pin, TMR2, PB10, 1); // [I]
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel4Pin, TMR2, PA3, 1); // [I]
+#[cfg(not(all(feature = "embassy", feature = "time-driver-tim2")))]
 crate::pin_trait_impl!(crate::timer::Channel4Pin, TMR2, PB11, 1); // [I]
 
 crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR3, PA6, 2); // [V] pwm_output_tmr3 example
@@ -419,3 +146,34 @@ crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR5, PA0, 2); // [I] DS funct
 crate::pin_trait_impl!(crate::timer::Channel2Pin, TMR5, PA1, 2); // [I] DS function table
 crate::pin_trait_impl!(crate::timer::Channel3Pin, TMR5, PA2, 2); // [I] DS function table
 crate::pin_trait_impl!(crate::timer::Channel4Pin, TMR5, PA3, 2); // [I] DS function table
+
+// Small timers (2-ch TMR9/12, 1-ch TMR10/11/13/14); mux from RM V2.09 table
+// 6-1/6-2 page-image read ([V] 2026-11-17): TMR9 = mux3, TMR10/11 = mux3,
+// TMR12 = mux9, TMR13/14 = mux9
+crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR9, PA2, 3); // [V] p114
+crate::pin_trait_impl!(crate::timer::Channel2Pin, TMR9, PA3, 3); // [V] p114
+crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR12, PB14, 9); // [V] p117
+crate::pin_trait_impl!(crate::timer::Channel2Pin, TMR12, PB15, 9); // [V] p117
+crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR10, PB8, 3); // [V] p116
+crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR11, PB9, 3); // [V] p116
+crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR13, PA6, 9); // [V] p115
+crate::pin_trait_impl!(crate::timer::Channel1Pin, TMR14, PA7, 9); // [V] p115
+
+// Frequency configuration shared by the up-counting time base and PWM
+// drivers. Choose the smallest prescaler that fits PR to retain resolution.
+fn frequency_dividers(
+    clock: crate::time::Hertz,
+    frequency: crate::time::Hertz,
+    max_period: u32,
+) -> (u16, u32) {
+    assert!(frequency.0 > 0, "timer frequency must be > 0");
+    assert!(
+        frequency.0 <= clock.0 / 2,
+        "timer period must contain at least two ticks"
+    );
+    let ticks = clock.0.div_ceil(frequency.0);
+    let prescaler = ticks.div_ceil(max_period);
+    let div = u16::try_from(prescaler - 1).expect("timer prescaler exceeds 16 bits");
+    let period = ticks.div_ceil(prescaler);
+    (div, period - 1)
+}

@@ -2,3 +2,9 @@
 # (thumbv7em-none-eabihf, AT32F435 = Cortex-M4F)
 [build]
 target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip AT32F435CGT7"
+
+[env]
+DEFMT_LOG = "debug"

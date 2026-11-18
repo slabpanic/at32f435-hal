@@ -30,6 +30,13 @@ const RLD_MAX: u64 = 0xFFF;
 
 /// Independent watchdog handle: holds the singleton proof; `feed()` feeds the
 /// watchdog.
+///
+/// **Timing warning (evb sample, 2026-11-17):** the WDT counts on LICK, whose
+/// real frequency on this sample deviates strongly from the 40 kHz nominal -
+/// measured timeouts came out 3-9x the nominal value (nominal 5 s -> ~15-45 s,
+/// two capture runs; the exact factor varies with the config written). The
+/// `timeout_ms` value is therefore nominal-only; calibrate empirically per
+/// board before relying on WDT timing. See `docs/pitfalls.md`.
 pub struct IndependentWdt {
     _peri: Peri<'static, crate::peripherals::WDT>,
 }
@@ -46,7 +53,15 @@ impl IndependentWdt {
         let ticks = (LICK_FREQ.0 as u64) * (timeout_ms as u64) / 1_000;
 
         // Smallest divider so that RLD <= 0xFFF (a smaller divider gives higher resolution)
-        const DIVS: [(u32, u8); 7] = [(4, 0), (8, 1), (16, 2), (32, 3), (64, 4), (128, 5), (256, 6)];
+        const DIVS: [(u32, u8); 7] = [
+            (4, 0),
+            (8, 1),
+            (16, 2),
+            (32, 3),
+            (64, 4),
+            (128, 5),
+            (256, 6),
+        ];
         let Some((div, div_code)) = DIVS
             .into_iter()
             .find(|(_, code)| ticks >> (code + 2) <= RLD_MAX)
@@ -83,13 +98,12 @@ impl IndependentWdt {
     /// # Panics
     ///
     /// Panics if `rld` exceeds 12 bits.
-    pub fn start_raw(
-        peri: Peri<'static, crate::peripherals::WDT>,
-        div_code: u8,
-        rld: u16,
-    ) -> Self {
+    pub fn start_raw(peri: Peri<'static, crate::peripherals::WDT>, div_code: u8, rld: u16) -> Self {
         assert!(rld as u64 <= RLD_MAX, "RLD exceeds 12 bits");
-        assert!(div_code <= 6, "DIV code must be 0..=6 (0x7 and 0x6 are both /256)");
+        assert!(
+            div_code <= 6,
+            "DIV code must be 0..=6 (0x7 and 0x6 are both /256)"
+        );
         let wdt = unsafe { &*pac::WDT::PTR };
         wdt.cmd().write(|w| w.cmd().unlock());
         wdt.div().write(|w| {
@@ -108,6 +122,47 @@ impl IndependentWdt {
         while wdt.sts().read().divf().bit_is_set() || wdt.sts().read().rldf().bit_is_set() {}
         wdt.cmd().write(|w| w.cmd().enable());
         Self { _peri: peri }
+    }
+
+    /// Reconfigures a running watchdog (unlock + div/rld + enable). The WDT
+    /// cannot be disabled once enabled, only re-timed; note it keeps running
+    /// across system resets, so a boot that inherits a short timeout must
+    /// restart it early.
+    pub fn restart(&mut self, timeout_ms: u32) {
+        let ticks = (LICK_FREQ.0 as u64) * (timeout_ms as u64) / 1_000;
+        const DIVS: [(u32, u8); 7] = [
+            (4, 0),
+            (8, 1),
+            (16, 2),
+            (32, 3),
+            (64, 4),
+            (128, 5),
+            (256, 6),
+        ];
+        let Some((div, div_code)) = DIVS
+            .into_iter()
+            .find(|(_, code)| ticks >> (code + 2) <= RLD_MAX)
+        else {
+            panic!("WDT timeout too long: max is about 26.2 s (4095 * 256 / 40 kHz)");
+        };
+        let rld = (ticks / div as u64).max(1);
+        let wdt = unsafe { &*pac::WDT::PTR };
+        wdt.cmd().write(|w| w.cmd().unlock());
+        wdt.div().write(|w| {
+            match div_code {
+                0 => w.div().div4(),
+                1 => w.div().div8(),
+                2 => w.div().div16(),
+                3 => w.div().div32(),
+                4 => w.div().div64(),
+                5 => w.div().div128(),
+                _ => w.div().div256(),
+            };
+            w
+        });
+        wdt.rld().write(|w| w.rld().set(rld as u16));
+        while wdt.sts().read().divf().bit_is_set() || wdt.sts().read().rldf().bit_is_set() {}
+        wdt.cmd().write(|w| w.cmd().enable());
     }
 
     /// Feeds the watchdog (CMD = 0xAAAA).

@@ -5,7 +5,8 @@
 //! section protected `Cell<u64>`, because the thumbv7em target has no 64-bit
 //! atomics); `now()` uses CVR to interpolate within the millisecond down to
 //! microseconds. The waker queue uses embassy-time-queue-utils' `Queue`, and
-//! due dispatching happens in the SysTick exception.
+//! due dispatching happens in the SysTick exception. Keep SysTick service
+//! latency below one period because the NVIC records only one pending wrap.
 //!
 //! Reference: embassy-time/src/driver_mock.rs (queue usage of the official
 //! mock driver).
@@ -18,9 +19,15 @@ use critical_section::Mutex as CsMutex;
 use embassy_time_driver::{time_driver_impl, Driver, TICK_HZ};
 use embassy_time_queue_utils::Queue;
 
+use super::scale;
+
 /// SysTick reload value (1 ms period), written by `init()` from the current
 /// system clock.
 static RELOAD: AtomicU32 = AtomicU32::new(0);
+const PERIOD_HZ: u32 = 1_000;
+const SYST_CVR: *const u32 = 0xE000_E018 as *const u32;
+const SCB_ICSR: *const u32 = 0xE000_ED04 as *const u32;
+const PENDSTSET: u32 = 1 << 26;
 
 /// Millisecond counter: the thumbv7em target has no 64-bit atomics (a Rust
 /// target spec limitation), so a critical-section protected Cell is used
@@ -45,8 +52,12 @@ impl TimeDriver {
     /// Configures SysTick: Core clock source, 1 ms period, interrupt enabled.
     /// Called once from `hal::init()`.
     pub(crate) fn init(&'static self) {
-        let sysclk = crate::rcc::clocks().sysclk.0;
-        let reload = sysclk / 1_000 - 1;
+        let hclk = crate::rcc::clocks().hclk.0;
+        assert!(
+            hclk >= 2 * PERIOD_HZ,
+            "HCLK is too slow for the SysTick time driver"
+        );
+        let reload = hclk / PERIOD_HZ - 1;
         RELOAD.store(reload, Ordering::Relaxed);
 
         // The executor's #[embassy_executor::main] has already taken
@@ -62,31 +73,39 @@ impl TimeDriver {
         syst.enable_interrupt();
     }
 
-    #[inline]
-    fn now_parts() -> (u64, u64) {
-        // ms and CVR must be read together atomically (otherwise interrupt
-        // tearing makes the reading jump backwards), hence the critical section.
-        critical_section::with(|cs| {
-            let ms = DRIVER.ms.borrow(cs).get();
+    fn now_at_rate(&self, hz: u64) -> u64 {
+        let (ms, elapsed_cycles) = critical_section::with(|cs| {
+            let ms = self.ms.borrow(cs).get();
             let reload = RELOAD.load(Ordering::Relaxed);
-            // SysTick counts down: the smaller CVR is, the more of this
-            // millisecond has elapsed.
-            // Read SYST_CVR @ 0xE000E018 via a direct address to avoid stealing
-            // the core peripheral singleton.
-            let cvr = unsafe { (0xE000_E018 as *const u32).read_volatile() };
-            // Microseconds elapsed within the current millisecond
-            // (ticks_per_us = (reload+1)/1000 = sysclk/1e6)
-            let ticks_per_us = (reload + 1) / 1_000;
-            let sub_us = ((reload + 1 - cvr.min(reload + 1)) / ticks_per_us) as u64;
-            (ms, sub_us)
-        })
+            if reload == 0 {
+                return (ms, 0);
+            }
+            // Sample CVR again if hardware wrapped before we checked the
+            // pending bit. SysTick cannot advance the software count in
+            // this critical section.
+            let mut current = unsafe { SYST_CVR.read_volatile() };
+            let pending = unsafe { SCB_ICSR.read_volatile() } & PENDSTSET != 0;
+            if pending {
+                current = unsafe { SYST_CVR.read_volatile() };
+            }
+            let elapsed = if current == 0 { 0 } else { reload - current };
+            (ms + u64::from(pending), elapsed)
+        });
+        // Count cycles at the actual AHB rate so an HCLK which is not a
+        // multiple of PERIOD_HZ does not accrue a fixed error every tick.
+        let hclk = crate::rcc::clocks().hclk.0;
+        let period_cycles = RELOAD.load(Ordering::Relaxed) + 1;
+        if hz == 1_000_000 && hclk.is_multiple_of(1_000_000) {
+            return ms * 1_000 + u64::from(elapsed_cycles / (hclk / 1_000_000));
+        }
+        let cycles = ms * u64::from(period_cycles) + u64::from(elapsed_cycles);
+        scale(cycles, u64::from(hclk), hz)
     }
 }
 
 impl Driver for TimeDriver {
     fn now(&self) -> u64 {
-        let (ms, sub_us) = Self::now_parts();
-        (ms * 1_000 + sub_us) * TICK_HZ / 1_000_000
+        self.now_at_rate(TICK_HZ)
     }
 
     fn schedule_wake(&self, at: u64, waker: &Waker) {
@@ -103,7 +122,7 @@ impl Driver for TimeDriver {
 /// Current time (microseconds, converted from TICK_HZ), for defmt timestamps
 /// and the like.
 pub fn now_us() -> u64 {
-    DRIVER.now() * 1_000_000 / TICK_HZ
+    DRIVER.now_at_rate(1_000_000)
 }
 
 /// Driver entry point (called by `embassy::init()`).
@@ -124,6 +143,6 @@ fn SysTick() {
         DRIVER
             .queue
             .borrow_ref_mut(cs)
-            .next_expiration(ms * 1_000 * TICK_HZ / 1_000_000);
+            .next_expiration(DRIVER.now());
     });
 }

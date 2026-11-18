@@ -48,7 +48,10 @@ macro_rules! pwm_pin_channel {
         impl<'d, T: GeneralInstance> PwmPin<'d, T, $channel> {
             #[doc = $doc]
             pub fn $new_chx(pin: Peri<'d, impl crate::timer::$pin_trait<T>>) -> Self {
-                pin.set_as_af(pin.af_num(), AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
+                pin.set_as_af(
+                    pin.af_num(),
+                    AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None),
+                );
                 Self {
                     _pin: pin.into(),
                     phantom: PhantomData,
@@ -122,12 +125,7 @@ impl<'d, T: GeneralInstance> SimplePwm<'d, T> {
         regs.set_pmen(T::BITS == 32);
         regs.set_prben(true);
 
-        let channels = [
-            ch1.is_some(),
-            ch2.is_some(),
-            ch3.is_some(),
-            ch4.is_some(),
-        ];
+        let channels = [ch1.is_some(), ch2.is_some(), ch3.is_some(), ch4.is_some()];
 
         let mut this = Self { peri, channels };
         this.set_frequency(freq);
@@ -154,18 +152,13 @@ impl<'d, T: GeneralInstance> SimplePwm<'d, T> {
     /// Set the PWM frequency (allocates the prescaler and period reload
     /// automatically; the OVF event latches the shadow registers).
     pub fn set_frequency(&mut self, freq: Hertz) {
-        assert!(freq.0 > 0, "PWM frequency must be > 0");
-        let clk = T::frequency().0 as u64;
-        let ticks = clk / freq.0 as u64;
-        assert!(ticks > 0, "PWM frequency exceeds the timer clock resolution");
-        let max_ticks = (1u64 << T::BITS) - 1;
-        let prescaler = ((ticks - 1) / max_ticks) as u16;
-        let period = ticks / (prescaler as u64 + 1);
-        assert!(period >= 2, "PWM frequency too high (period register < 2)");
+        // Leave a representable compare value for 100% duty.
+        let max_period = ((1u64 << T::BITS) - 1) as u32;
+        let (prescaler, period) = super::frequency_dividers(T::frequency(), freq, max_period);
         let regs = T::regs();
         regs.set_tmren(false);
         regs.set_div(prescaler);
-        regs.set_pr((period - 1) as u32);
+        regs.set_pr(period);
         regs.swevt_ovf(); // generate an update event to load the shadow registers
         regs.clear_ovf_flag(); // the software update event sets OVFIF; clear it to avoid false detection
         regs.set_tmren(true);

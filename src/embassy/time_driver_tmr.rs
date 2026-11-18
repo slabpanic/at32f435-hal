@@ -10,17 +10,17 @@
 //!
 //! WARNING: The `TMR2` interrupt (vector `TMR2`) is owned by this driver: applications
 //! must not `bind_interrupts!` for it again.
-//! WARNING: Compile-checked only (the evb defaults to the systick path); not
-//! regression-tested on hardware - if you switch this feature on, test it on
-//! the board first.
+//! Verified on the AT32F435CGT7 EVB with concurrent timers expiring in
+//! deadline order.
 
 use core::cell::{Cell, RefCell};
-use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Waker;
 
 use critical_section::Mutex as CsMutex;
 use embassy_time_driver::{time_driver_impl, Driver, TICK_HZ};
 use embassy_time_queue_utils::Queue;
+
+use super::scale;
 
 fn tmr() -> &'static crate::pac::tmr2::RegisterBlock {
     unsafe { &*crate::pac::TMR2::PTR }
@@ -28,7 +28,7 @@ fn tmr() -> &'static crate::pac::tmr2::RegisterBlock {
 
 struct TimerDriver {
     /// Number of 32-bit counter overflows (high bits of the tick).
-    period: AtomicU32,
+    period: CsMutex<Cell<u32>>,
     /// Current alarm timestamp (in ticks); u64::MAX when no alarm is pending.
     alarm: CsMutex<Cell<u64>>,
     queue: CsMutex<RefCell<Queue>>,
@@ -37,7 +37,7 @@ struct TimerDriver {
 impl TimerDriver {
     const fn new() -> Self {
         Self {
-            period: AtomicU32::new(0),
+            period: CsMutex::new(Cell::new(0)),
             alarm: CsMutex::new(Cell::new(u64::MAX)),
             queue: CsMutex::new(RefCell::new(Queue::new())),
         }
@@ -50,13 +50,21 @@ impl TimerDriver {
     /// Configures TMR2: PSC divider, PR at full range, overflow/C1 compare
     /// interrupts, and starts counting.
     pub(crate) fn init(&'static self) {
-        <crate::peripherals::TMR2 as crate::peripheral::RccPeripheral>::enable_and_reset();
+        <crate::peripherals::TMR2 as crate::peripheral::ClockControl>::enable_and_reset();
         let t = tmr();
 
         // Divide the timer clock (2*PCLK1 when the APB1 prescaler > 1) down to TICK_HZ
         let timer_freq = crate::rcc::clocks().pclk1_tim.0;
-        let psc = timer_freq / TICK_HZ as u32 - 1;
-        assert!(psc <= 0xFFFF, "TMR2 prescaler exceeds 16 bits (clock tree misconfigured)");
+        let tick_hz = u32::try_from(TICK_HZ).expect("tick rate exceeds the TMR2 clock");
+        assert!(
+            tick_hz != 0 && timer_freq >= tick_hz && timer_freq.is_multiple_of(tick_hz),
+            "TMR2 clock must be an integer multiple of the time driver tick rate"
+        );
+        let psc = timer_freq / tick_hz - 1;
+        assert!(
+            psc <= 0xFFFF,
+            "TMR2 prescaler exceeds 16 bits (clock tree misconfigured)"
+        );
 
         t.ctrl1().modify(|_, w| {
             w.tmren().clear_bit(); // stop the timer while configuring
@@ -65,8 +73,9 @@ impl TimerDriver {
         });
         t.div().write(|w| w.set(psc as u16));
         t.pr().write(|w| w.set(u32::MAX));
-        // Clear stale flags (write 0 to clear), enable overflow + C1 compare
-        // interrupts, enable the compare channel
+        // Load the buffered prescaler immediately, then clear the update flag.
+        t.swevt().write(|w| w.ovfswtr().overflow());
+        // The queue arms C1 when it has a deadline.
         t.ists().write(|w| {
             w.ovfif().clear();
             w.c1if().clear();
@@ -74,78 +83,75 @@ impl TimerDriver {
         });
         t.iden().modify(|_, w| {
             w.ovfien().set_bit();
-            w.c1ien().set_bit();
+            w.c1ien().clear_bit();
             w
         });
         t.cctrl().modify(|_, w| w.c1en().set_bit());
         t.ctrl1().modify(|_, w| w.tmren().set_bit());
 
-        unsafe {
-            cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::TMR2);
-        }
+        cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::TMR2);
+        unsafe { cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::TMR2) };
     }
 
     fn on_interrupt(&self) {
+        critical_section::with(|cs| {
+            let t = tmr();
+            let status = t.ists().read();
+            if status.ovfif().bit_is_set() {
+                t.ists().write(|w| w.ovfif().clear());
+                let period = self.period.borrow(cs);
+                period.set(period.get().wrapping_add(1));
+            }
+            if status.c1if().bit_is_set() {
+                t.ists().write(|w| w.c1if().clear());
+            }
+            if self.now_locked(cs) >= self.alarm.borrow(cs).get() {
+                self.dispatch_and_arm(cs, &mut self.queue.borrow_ref_mut(cs));
+            }
+        });
+    }
+
+    fn now_locked(&self, cs: critical_section::CriticalSection<'_>) -> u64 {
         let t = tmr();
-        let ists = t.ists().read();
-        if ists.ovfif().bit_is_set() {
-            t.ists().write(|w| w.ovfif().clear());
-            self.period.fetch_add(1, Ordering::Relaxed);
+        let mut period = self.period.borrow(cs).get();
+        let mut counter = t.cval().read().bits();
+        if t.ists().read().ovfif().bit_is_set() {
+            period = period.wrapping_add(1);
+            counter = t.cval().read().bits();
         }
-        if ists.c1if().bit_is_set() {
+        (u64::from(period) << 32) | u64::from(counter)
+    }
+
+    fn dispatch_and_arm(&self, cs: critical_section::CriticalSection<'_>, queue: &mut Queue) {
+        let t = tmr();
+        loop {
+            let next = queue.next_expiration(self.now_locked(cs));
+            self.alarm.borrow(cs).set(next);
+            t.iden().modify(|_, w| w.c1ien().clear_bit());
+            if next == u64::MAX {
+                return;
+            }
+            t.c1dt().write(|w| w.set(next as u32));
             t.ists().write(|w| w.c1if().clear());
-            critical_section::with(|cs| {
-                let ts = self.alarm.borrow(cs).get();
-                if self.now() >= ts {
-                    self.queue.borrow_ref_mut(cs).next_expiration(self.now());
-                }
-            });
+            t.iden().modify(|_, w| w.c1ien().set_bit());
+            // The compare match can pass while changing the register.
+            if self.now_locked(cs) < next {
+                return;
+            }
         }
-    }
-
-    /// Current 64-bit tick (tick rate = TICK_HZ).
-    ///
-    /// When the overflow flag is pending but the ISR has not run yet (NVIC
-    /// latency), the high bits are period+1 - the reading stays monotonic,
-    /// with an error bounded by the ISR latency.
-    fn now(&self) -> u64 {
-        let t = tmr();
-        let period = self.period.load(Ordering::Relaxed);
-        let cval = t.cval().read().bits();
-        let pending = t.ists().read().ovfif().bit_is_set();
-        let hi = if pending { period + 1 } else { period };
-        ((hi as u64) << 32) | cval as u64
-    }
-
-    /// Sets the C1 compare alarm; returns false if the alarm timestamp has
-    /// already passed (the caller should dispatch the queue immediately).
-    fn set_alarm(&self, cs: critical_section::CriticalSection<'_>, timestamp: u64) -> bool {
-        self.alarm.borrow(cs).set(timestamp);
-        if timestamp <= self.now() {
-            return false;
-        }
-        // cval is a 32-bit tick: compare against the low 32 bits of the
-        // timestamp directly (the high bits are covered by the overflow count)
-        tmr().c1dt().write(|w| w.set(timestamp as u32));
-        true
     }
 }
 
 impl Driver for TimerDriver {
     fn now(&self) -> u64 {
-        self.now()
+        critical_section::with(|cs| self.now_locked(cs))
     }
 
     fn schedule_wake(&self, at: u64, waker: &Waker) {
         critical_section::with(|cs| {
             let mut q = self.queue.borrow_ref_mut(cs);
             q.schedule_wake(at, waker);
-            let next = q.next_expiration(self.now());
-            if !self.set_alarm(cs, next) {
-                // Alarm already expired: dispatch another round immediately
-                let next = q.next_expiration(self.now());
-                let _ = self.set_alarm(cs, next);
-            }
+            self.dispatch_and_arm(cs, &mut q);
         });
     }
 }
@@ -153,7 +159,7 @@ impl Driver for TimerDriver {
 /// Current time (microseconds, converted from TICK_HZ), for defmt timestamps
 /// and the like.
 pub fn now_us() -> u64 {
-    DRIVER.now() * 1_000_000 / TICK_HZ
+    scale(DRIVER.now(), TICK_HZ, 1_000_000)
 }
 
 /// Driver entry point (called by `embassy::init()`).

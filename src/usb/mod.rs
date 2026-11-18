@@ -1,11 +1,17 @@
-//! USB device driver: OTGFS1 (PA11/PA12) / OTGFS2 (PB14/PB15), Synopsys OTG FS
-//! core.
+//! USB OTG driver: OTGFS1 (PA11/PA12) / OTGFS2 (PB14/PB15), Synopsys OTG FS
+//! core, device and host mode.
 //!
 //! The protocol stack comes from [`embassy_usb_synopsys_otg`] (the same one as
 //! embassy-stm32, with raw-pointer register definitions, no PAC dependency);
 //! this module only adapts the instances: register pointers, FIFO depth
 //! (320 words), the USB 48 MHz clock configuration, NVIC binding, and
 //! AT32-specific register differences.
+//!
+//! - Device mode ([`Driver`], [`InterruptHandler`]): the stack's device half,
+//!   as consumed by `embassy-usb` class drivers (CDC-ACM, HID, MSC, ...).
+//! - Host mode ([`host::UsbHost`], [`host::HostInterruptHandler`]): the
+//!   stack's host half, as consumed by the `embassy_usb_driver::host` traits;
+//!   plus an [`host::enumerate`] helper for the standard device enumeration.
 //!
 //! Verified differences between AT32F435 and STM32F4 OTG_FS (RM 21.3 / PAC
 //! cross-check):
@@ -49,21 +55,24 @@
 //! of the max packet sizes of all OUT endpoints (256-512 bytes is enough for
 //! full-speed CDC); endpoint allocation errors out if it is too small.
 
+pub mod host;
+
 use core::marker::PhantomData;
 
 use embassy_usb_driver::{EndpointAddress, EndpointAllocError, EndpointType, Event, Unsupported};
-pub use embassy_usb_synopsys_otg::Config;
-use embassy_usb_synopsys_otg::otg_v1::Otg;
+use embassy_usb_synopsys_otg::host::{HostState, HostStateStorage};
 use embassy_usb_synopsys_otg::otg_v1::vals::Dspd;
+use embassy_usb_synopsys_otg::otg_v1::Otg;
+pub use embassy_usb_synopsys_otg::Config;
 use embassy_usb_synopsys_otg::{
-    Bus as OtgBus, ControlPipe, Driver as OtgDriver, Endpoint, In, OtgInstance, Out, PhyType, State,
-    StateStorage, on_interrupt as on_interrupt_impl,
+    on_interrupt as on_interrupt_impl, Bus as OtgBus, ControlPipe, Driver as OtgDriver, Endpoint,
+    In, OtgInstance, Out, PhyType, State, StateStorage,
 };
 
 use crate::gpio::{AfType, OutputType, Pull, Speed};
 use crate::interrupt::typelevel::{Binding, Handler, Interrupt as _};
 use crate::peripheral::RccPeripheral;
-use crate::{Peri, interrupt, pac};
+use crate::{interrupt, pac, Peri};
 
 /// Extra RX FIFO reserve (embassy-stm32's rule-of-thumb value: RXFLVL status
 /// word + back-to-back packet buffering).
@@ -99,8 +108,14 @@ impl<'d, T: Instance> Driver<'d, T> {
         ep_out_buffer: &'d mut [u8],
         config: Config,
     ) -> Self {
-        dp.set_as_af(dp.af_num(), AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
-        dm.set_as_af(dm.af_num(), AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
+        dp.set_as_af(
+            dp.af_num(),
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None),
+        );
+        dm.set_as_af(
+            dm.af_num(),
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None),
+        );
 
         let instance = OtgInstance {
             regs: T::regs(),
@@ -131,7 +146,8 @@ impl<'d, T: Instance> embassy_usb_driver::Driver<'d> for Driver<'d, T> {
         max_packet_size: u16,
         interval_ms: u8,
     ) -> Result<Self::EndpointIn, EndpointAllocError> {
-        self.inner.alloc_endpoint_in(ep_type, ep_addr, max_packet_size, interval_ms)
+        self.inner
+            .alloc_endpoint_in(ep_type, ep_addr, max_packet_size, interval_ms)
     }
 
     fn alloc_endpoint_out(
@@ -141,7 +157,8 @@ impl<'d, T: Instance> embassy_usb_driver::Driver<'d> for Driver<'d, T> {
         max_packet_size: u16,
         interval_ms: u8,
     ) -> Result<Self::EndpointOut, EndpointAllocError> {
-        self.inner.alloc_endpoint_out(ep_type, ep_addr, max_packet_size, interval_ms)
+        self.inner
+            .alloc_endpoint_out(ep_type, ep_addr, max_packet_size, interval_ms)
     }
 
     fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
@@ -266,14 +283,14 @@ impl<'d, T: Instance> Drop for Bus<'d, T> {
 
 /// Configure the USB control clock to 48 MHz +/- 0.25% (RM 21.3.1).
 ///
-/// - SCLK=PLL: USBDIV (CRM_MISC2[15:12], half-step divider encoding) divides
+/// - SCLK=PLL: USBDIV (`CRM_MISC2[15:12]`, half-step divider encoding) divides
 ///   the PLL output (in this HAL, PLL output = sysclk) down to 48 MHz;
 /// - SCLK=HICK: HICK_TO_USB (CRM_MISC1 bit13) passes HICK 48M straight through;
 /// - SCLK=HEXT driven directly: 48M cannot be derived, so error out.
 ///
 /// Note: USBDIV is independent of the other MISC1/MISC2 fields (AUTO_STEP_EN,
 /// reserved values 0xD, etc.); always use read-modify-write.
-fn configure_usb_48m() {
+pub(crate) fn configure_usb_48m() {
     let crm = unsafe { &*pac::CRM::PTR };
     let sel = crm.cfg().read().sclksel();
     if sel.is_pll() {
@@ -286,7 +303,12 @@ fn configure_usb_48m() {
             .iter()
             .position(|&dx2| 24_000_000 * dx2 as u32 == pll)
             .map(|i| i as u8)
-            .unwrap_or_else(|| panic!("cannot derive USB 48 MHz from PLL {} Hz (no matching USBDIV step)", pll));
+            .unwrap_or_else(|| {
+                panic!(
+                    "cannot derive USB 48 MHz from PLL {} Hz (no matching USBDIV step)",
+                    pll
+                )
+            });
         crm.misc2().modify(|_, w| unsafe { w.usbdiv().bits(code) });
         crm.misc1().modify(|_, w| w.hick_to_usb().clear_bit());
     } else if sel.is_hick() {
@@ -305,7 +327,10 @@ fn calculate_trdt<T: Instance>(_speed: Dspd) -> u8 {
     if hclk >= 30_000_000 {
         0x5
     } else {
-        panic!("USB requires AHB > 30 MHz (RM 21.3.1); current HCLK = {} Hz", hclk);
+        panic!(
+            "USB requires AHB > 30 MHz (RM 21.3.1); current HCLK = {} Hz",
+            hclk
+        );
     }
 }
 
@@ -316,6 +341,14 @@ trait SealedInstance {
 
     fn regs() -> Otg;
     fn state() -> State<'static>;
+
+    /// Host-mode state storage (16 channels, RM 21.6.2 / official library
+    /// USB_HOST_CHANNEL_NUM = 16).
+    fn host_state() -> HostState<'static>;
+
+    /// AT32-specific patches applied after the core is enabled, before the
+    /// host stack starts (PHY power-up, VBUSIG, TRDT, frame interval).
+    fn host_preinit();
     /// Core ID (AT32 GUID@0x3C, reads 0x2000 on silicon; the crate's cid()
     /// reads 0x40, which is wrong here).
     fn core_id() -> u32;
@@ -326,7 +359,9 @@ trait SealedInstance {
 /// USB OTGFS instance trait (peripheral singleton -> registers / state /
 /// interrupt number).
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + RccPeripheral + embassy_hal_internal::PeripheralType + 'static {
+pub trait Instance:
+    SealedInstance + RccPeripheral + embassy_hal_internal::PeripheralType + 'static
+{
     /// This instance's interrupt (typelevel, used by `bind_interrupts!`).
     type Interrupt: interrupt::typelevel::Interrupt;
 }
@@ -341,6 +376,26 @@ impl SealedInstance for crate::peripherals::USB_OTG1 {
     fn state() -> State<'static> {
         static STATE: StateStorage<8> = StateStorage::new();
         STATE.as_state()
+    }
+
+    fn host_state() -> HostState<'static> {
+        static HOST_STATE: HostStateStorage<16> = HostStateStorage::new();
+        HOST_STATE.as_host_state()
+    }
+
+    fn host_preinit() {
+        let g = unsafe { &*pac::USB_OTG1_GLOBAL::PTR };
+        // PHY power-up (official usb_global_init pwrdown=TRUE) + VBUS sensing
+        // ignored (module doc difference #2).
+        g.gccfg()
+            .modify(|_, w| w.pwrdown().set_bit().vbusig().set_bit());
+        // 16-bit UTMI+ MAC turn-around time (RM 21.6.3.4: 0x5, AHB >= 30 MHz;
+        // also the reset value - this write is a belt-and-braces re-affirm).
+        g.gusbcfg()
+            .modify(|_, w| unsafe { w.usbtrdtim().bits(0x5) });
+        // NOTE: HFIR must NOT be written here - RM 21.6.4.2 allows writing it
+        // only after the port enable bit is set (earlier writes are ignored;
+        // hw-verified). The host stack writes 48000 after the port comes up.
     }
 
     fn core_id() -> u32 {
@@ -368,6 +423,20 @@ impl SealedInstance for crate::peripherals::USB_OTG2 {
     fn state() -> State<'static> {
         static STATE: StateStorage<8> = StateStorage::new();
         STATE.as_state()
+    }
+
+    fn host_state() -> HostState<'static> {
+        static HOST_STATE: HostStateStorage<16> = HostStateStorage::new();
+        HOST_STATE.as_host_state()
+    }
+
+    fn host_preinit() {
+        let g = unsafe { &*pac::USB_OTG2_GLOBAL::PTR };
+        // Same patch set as USB_OTG1 (see that impl for register references).
+        g.gccfg()
+            .modify(|_, w| w.pwrdown().set_bit().vbusig().set_bit());
+        g.gusbcfg()
+            .modify(|_, w| unsafe { w.usbtrdtim().bits(0x5) });
     }
 
     fn core_id() -> u32 {

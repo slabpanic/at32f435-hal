@@ -357,9 +357,9 @@ mod driver {
 }
 
 #[cfg(feature = "exti")]
-pub use driver::{on_irq, ExtiInput, ExtiInputFuture};
-#[cfg(feature = "exti")]
 pub(crate) use driver::init;
+#[cfg(feature = "exti")]
+pub use driver::{on_irq, ExtiInput, ExtiInputFuture};
 
 /// Vector entries under `exti` + `rt` (owned by the HAL; applications must not
 /// bind them again).

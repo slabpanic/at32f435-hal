@@ -106,3 +106,19 @@ macro_rules! new_pin {
         Some(pin.into())
     }};
 }
+
+/// Declares a DMA signal trait: `trait TxDma<T: Instance>: ChannelInstance { fn request() -> Request }`.
+///
+/// Implemented for (peripheral instance, DMA channel singleton) pairs; the
+/// method returns the DMAMUX request line that routes this channel to the
+/// peripheral's TX (or RX) request. Drivers accept
+/// `Peri<'d, impl TxDma<T>>` so the application picks the physical channel.
+#[macro_export]
+macro_rules! dma_trait {
+    ($signal:ident, $instance:path) => {
+        pub trait $signal<T: $instance>: $crate::dma::ChannelInstance {
+            /// The DMAMUX request line for this (peripheral, channel) pair.
+            fn request() -> $crate::dma::Request;
+        }
+    };
+}

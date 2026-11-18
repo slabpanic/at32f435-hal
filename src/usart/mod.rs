@@ -3,9 +3,18 @@
 //!
 //! - Modes: [`mode::Async`] (interrupt-driven byte-by-byte + waker, no DMA) /
 //!   [`mode::Blocking`] (busy-wait polling).
+//! - DMA: [`Uart::write_dma`]/[`Uart::read_dma`] move the data over a DMA1/2
+//!   channel via DMAMUX (CTRL3.DMATEN/DMAREN); the TX path also waits for TDC
+//!   so the shift register drains (RS485 DE turnaround).
+//! - Hardware flow control (USART1/2/3/6): [`Uart::enable_flow_control`]
+//!   (CTRL3.RTSEN/CTSEN, RTS/CTS pins).
+//! - RS485 driver enable (USART1/2/3/6): [`Uart::enable_rs485`] drives DE on
+//!   the RTS pin with configurable polarity + TSDT/TCDT delays (CTRL1, 1/16
+//!   baud units); single-wire half-duplex via
+//!   [`Uart::set_single_wire_half_duplex`].
 //! - Async usage:
 //!   ```ignore
-//!   bind_interrupts!(struct Irqs { USART1 => hal::usart::InterruptHandler<hal::pac::USART1>; });
+//!   bind_interrupts!(struct Irqs { USART1 => hal::usart::InterruptHandler<hal::peripherals::USART1>; });
 //!   let mut uart = hal::usart::Uart::new(p.USART1, p.PA9, p.PA10, Irqs, config)?;
 //!   uart.write(&[b'a']).await?; let mut buf = [0u8; 16]; uart.read(&mut buf).await?;
 //!   ```
@@ -17,9 +26,11 @@
 //!   latches the error bits into `State.rx_errors` and the read side consumes
 //!   them from the latch, avoiding a race between the clear sequence and data
 //!   reads.
-//! - UART7/8 have no pin-mux table rows yet (trait impls to be added once
-//!   verified against the datasheet; the instances themselves work in blocking
-//!   mode via raw register access).
+//! - The pin trait table covers all eight instances; every entry is verified
+//!   against the RM V2.09 IOMUX tables 6-1..6-8 (GPIOA..GPIOH).
+
+mod dma;
+mod pins;
 
 use core::convert::Infallible;
 use core::future::poll_fn;
@@ -30,6 +41,7 @@ use core::task::Poll;
 use embassy_hal_internal::Peri;
 use embassy_sync::waitqueue::AtomicWaker;
 
+use crate::dma::DmaError;
 use crate::gpio::{AfType, OutputType, Pull, Speed};
 use crate::interrupt::typelevel::{Binding, Handler, Interrupt as _};
 use crate::peripheral::RccPeripheral;
@@ -111,6 +123,14 @@ pub enum Error {
     Noise,
     Overrun,
     Parity,
+    /// A DMA transfer failed.
+    Dma(DmaError),
+}
+
+impl From<DmaError> for Error {
+    fn from(e: DmaError) -> Self {
+        Error::Dma(e)
+    }
 }
 
 impl embedded_hal_nb::serial::Error for Error {
@@ -120,6 +140,7 @@ impl embedded_hal_nb::serial::Error for Error {
             Error::Noise => embedded_hal_nb::serial::ErrorKind::Noise,
             Error::Overrun => embedded_hal_nb::serial::ErrorKind::Overrun,
             Error::Parity => embedded_hal_nb::serial::ErrorKind::Parity,
+            Error::Dma(_) => embedded_hal_nb::serial::ErrorKind::Other,
         }
     }
 }
@@ -206,31 +227,23 @@ impl_usart_instance!(UART8, UART8);
 
 crate::pin_trait!(TxPin, Instance);
 crate::pin_trait!(RxPin, Instance);
+// USART CTS input (USART1/2/3/6 only; UART4/5/7/8 have no CTS/RTS pins).
+crate::pin_trait!(CtsPin, Instance);
+// USART RTS output; also the RS485 driver-enable (DE) output pin.
+crate::pin_trait!(RtsPin, Instance);
 
-// AF number 7 = USART/UART family (checked against Artery's official examples
-// and the DS function table; [I] = inferred row)
-crate::pin_trait_impl!(crate::usart::TxPin, USART1, PA9, 7); // [V] official BSP
-crate::pin_trait_impl!(crate::usart::TxPin, USART1, PB6, 7); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, USART1, PA10, 7); // [V/I]
-crate::pin_trait_impl!(crate::usart::RxPin, USART1, PB7, 7); // [I]
-crate::pin_trait_impl!(crate::usart::TxPin, USART2, PA2, 7); // [V] official example
-crate::pin_trait_impl!(crate::usart::TxPin, USART2, PD6, 7); // [V] official example
-crate::pin_trait_impl!(crate::usart::RxPin, USART2, PA3, 7); // [V] official example
-crate::pin_trait_impl!(crate::usart::RxPin, USART2, PD5, 7); // [V] official example
-crate::pin_trait_impl!(crate::usart::TxPin, USART3, PB10, 7); // [V] official example
-crate::pin_trait_impl!(crate::usart::TxPin, USART3, PC4, 7); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, USART3, PB11, 7); // [V] official example
-crate::pin_trait_impl!(crate::usart::RxPin, USART3, PC5, 7); // [I]
-crate::pin_trait_impl!(crate::usart::TxPin, USART6, PC6, 7); // [I]
-crate::pin_trait_impl!(crate::usart::TxPin, USART6, PG14, 7); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, USART6, PC7, 7); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, USART6, PG15, 7); // [I]
-crate::pin_trait_impl!(crate::usart::TxPin, UART4, PA0, 8); // [I] mux8 = UART family (STM32-style)
-crate::pin_trait_impl!(crate::usart::TxPin, UART4, PC10, 8); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, UART4, PA1, 8); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, UART4, PC11, 8); // [I]
-crate::pin_trait_impl!(crate::usart::TxPin, UART5, PC12, 8); // [I]
-crate::pin_trait_impl!(crate::usart::RxPin, UART5, PD2, 8); // [I]
+crate::dma_trait!(TxDma, Instance);
+crate::dma_trait!(RxDma, Instance);
+
+/// RS485 driver-enable polarity (CTRL3.DEP).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub enum DePolarity {
+    /// DE asserted high while transmitting.
+    #[default]
+    ActiveHigh,
+    /// DE asserted low while transmitting.
+    ActiveLow,
+}
 
 /// Interrupt handler: bind it to the instance's IRQ vector via `bind_interrupts!`.
 pub struct InterruptHandler<T: Instance> {
@@ -249,8 +262,7 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
             | (u8::from(sts.ferr().bit_is_set()) * ERR_FERR)
             | (u8::from(sts.nerr().bit_is_set()) * ERR_NERR)
             | (u8::from(sts.roerr().bit_is_set()) * ERR_ROERR);
-        if err_bits != 0
-            && (ctrl1.rdbfien().bit_is_set() || r.ctrl3().read().errien().bit_is_set())
+        if err_bits != 0 && (ctrl1.rdbfien().bit_is_set() || r.ctrl3().read().errien().bit_is_set())
         {
             // Latch the error bits for the read side to consume; disable the
             // RX interrupt to stop repeated false reports
@@ -261,12 +273,17 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         }
 
         if ctrl1.rdbfien().bit_is_set() && sts.rdbf().bit_is_set() {
+            // Disable the IE so the flag (which only clears on a DT read)
+            // cannot keep the IRQ line asserted without a reader.
+            r.ctrl1().modify(|_, w| w.rdbfien().disable());
             s.rx_waker.wake();
         }
         if ctrl1.tdbeien().bit_is_set() && sts.tdbe().bit_is_set() {
+            r.ctrl1().modify(|_, w| w.tdbeien().disable());
             s.tx_waker.wake();
         }
         if ctrl1.tdcien().bit_is_set() && sts.tdc().bit_is_set() {
+            r.ctrl1().modify(|_, w| w.tdcien().disable());
             s.tx_waker.wake();
         }
     }
@@ -402,18 +419,17 @@ impl<'d, T: Instance> Uart<'d, T, mode::Async> {
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let tx_pin = new_pin!(tx, AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
+        let tx_pin = new_pin!(
+            tx,
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None)
+        );
         let rx_pin = new_pin!(rx, AfType::input(Pull::None));
         let this = Self::new_inner(peri, tx_pin, rx_pin, config, true, true)?;
-        // Enable the TX/RX interrupts (left always on; the ISR only acts when
-        // this driver's flags are set)
+        // RX interrupt only: TDBE/TDC are set at reset and re-assert while
+        // idle, so leaving their IEs on would storm the NVIC; the async
+        // write/flush futures arm them while pending instead.
         let r = T::regs();
-        r.ctrl1().modify(|_, w| {
-            w.rdbfien().enable();
-            w.tdbeien().enable();
-            w.tdcien().enable();
-            w
-        });
+        r.ctrl1().modify(|_, w| w.rdbfien().enable());
         r.ctrl3().modify(|_, w| w.errien().enable());
         T::Interrupt::enable();
         Ok(this)
@@ -452,7 +468,10 @@ impl<'d, T: Instance> Uart<'d, T, mode::Blocking> {
         rx: Peri<'d, impl RxPin<T>>,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let tx_pin = new_pin!(tx, AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
+        let tx_pin = new_pin!(
+            tx,
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None)
+        );
         let rx_pin = new_pin!(rx, AfType::input(Pull::None));
         Self::new_inner(peri, tx_pin, rx_pin, config, true, true)
     }
@@ -476,6 +495,63 @@ impl<'d, T: Instance, M: mode::Mode> Uart<'d, T, M> {
             _rx_pin: rx_pin,
             _mode: PhantomData,
         })
+    }
+
+    /// Enables RTS/CTS hardware flow control (CTRL3.RTSEN/CTSEN). The pins
+    /// are switched to the USART alternate function here; UART4/5/7/8 have
+    /// no flow-control pins (their CtsPin/RtsPin traits are not implemented).
+    pub fn enable_flow_control(
+        &mut self,
+        cts: Peri<'_, impl CtsPin<T>>,
+        rts: Peri<'_, impl RtsPin<T>>,
+    ) {
+        cts.set_as_af(cts.af_num(), AfType::input(Pull::None));
+        rts.set_as_af(
+            rts.af_num(),
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None),
+        );
+        T::regs().ctrl3().modify(|_, w| {
+            w.rtsen().enable();
+            w.ctsen().enable();
+            w
+        });
+    }
+
+    /// Enables RS485 driver-enable mode (RM 12.4.5): DE comes out of the RTS
+    /// pin while transmitting, with the requested polarity. `start_delay` /
+    /// `complete_delay` are the TSDT/TCDT turnaround delays in 1/16 baud
+    /// periods (0..31, clamped). The TX path waits for TDC before returning,
+    /// so the hardware applies the complete-delay before DE deasserts.
+    pub fn enable_rs485(
+        &mut self,
+        rts: Peri<'_, impl RtsPin<T>>,
+        polarity: DePolarity,
+        start_delay: u8,
+        complete_delay: u8,
+    ) {
+        rts.set_as_af(
+            rts.af_num(),
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None),
+        );
+        let r = T::regs();
+        r.ctrl1().modify(|_, w| unsafe {
+            w.tsdt()
+                .bits(start_delay.min(31))
+                .tcdt()
+                .bits(complete_delay.min(31))
+        });
+        r.ctrl3().modify(|_, w| {
+            w.rs485en().bit(true);
+            w.dep().bit(polarity == DePolarity::ActiveLow);
+            w
+        });
+    }
+
+    /// Single-wire half-duplex mode (CTRL3.SLBEN): TX and RX share the TX
+    /// pin; the receiver is fed from the TX pin, so the USART receives its
+    /// own transmissions.
+    pub fn set_single_wire_half_duplex(&mut self, on: bool) {
+        T::regs().ctrl3().modify(|_, w| w.slben().bit(on));
     }
 
     /// Blocking write (works in both modes).
@@ -507,13 +583,16 @@ impl<'d, T: Instance> Uart<'d, T, mode::Async> {
     /// Async write of all bytes (waits for TDBE byte by byte).
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), Error> {
         for &b in buf {
-            poll_fn(|cx| {
+            poll_fn(|cx| -> Poll<Result<(), Error>> {
                 let r = T::regs();
                 T::state().tx_waker.register(cx.waker());
                 if r.sts().read().tdbe().bit_is_set() {
                     r.dt().write(|w| unsafe { w.bits(b as u16) });
                     Poll::Ready(Ok(()))
                 } else {
+                    // Buffer full: arm the TDBE interrupt until the ISR
+                    // consumes it (it disables the IE when it wakes us).
+                    r.ctrl1().modify(|_, w| w.tdbeien().enable());
                     Poll::Pending
                 }
             })
@@ -524,12 +603,13 @@ impl<'d, T: Instance> Uart<'d, T, mode::Async> {
 
     /// Async wait until transmission fully ends (TDC).
     pub async fn flush(&mut self) -> Result<(), Error> {
-        poll_fn(|cx| {
+        poll_fn(|cx| -> Poll<Result<(), Error>> {
             let r = T::regs();
             T::state().tx_waker.register(cx.waker());
             if r.sts().read().tdc().bit_is_set() {
                 Poll::Ready(Ok(()))
             } else {
+                r.ctrl1().modify(|_, w| w.tdcien().enable());
                 Poll::Pending
             }
         })
@@ -547,6 +627,9 @@ impl<'d, T: Instance> Uart<'d, T, mode::Async> {
                 if r.sts().read().rdbf().bit_is_set() {
                     Poll::Ready(r.dt().read().bits() as u8)
                 } else {
+                    // Arm the RDBF interrupt while pending (the ISR disables
+                    // it when it wakes us).
+                    r.ctrl1().modify(|_, w| w.rdbfien().enable());
                     Poll::Pending
                 }
             })
@@ -584,7 +667,10 @@ impl<'d, T: Instance> UartTx<'d, T, mode::Async> {
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let tx_pin = new_pin!(tx, AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
+        let tx_pin = new_pin!(
+            tx,
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None)
+        );
         T::enable_and_reset();
         let r = T::regs();
         configure(r, &config, T::frequency(), true, false)?;
@@ -604,13 +690,16 @@ impl<'d, T: Instance> UartTx<'d, T, mode::Async> {
     /// Async write of all bytes.
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), Error> {
         for &b in buf {
-            poll_fn(|cx| {
+            poll_fn(|cx| -> Poll<Result<(), Error>> {
                 let r = T::regs();
                 T::state().tx_waker.register(cx.waker());
                 if r.sts().read().tdbe().bit_is_set() {
                     r.dt().write(|w| unsafe { w.bits(b as u16) });
                     Poll::Ready(Ok(()))
                 } else {
+                    // Buffer full: arm the TDBE interrupt until the ISR
+                    // consumes it (it disables the IE when it wakes us).
+                    r.ctrl1().modify(|_, w| w.tdbeien().enable());
                     Poll::Pending
                 }
             })
@@ -621,12 +710,13 @@ impl<'d, T: Instance> UartTx<'d, T, mode::Async> {
 
     /// Async wait for TDC.
     pub async fn flush(&mut self) -> Result<(), Error> {
-        poll_fn(|cx| {
+        poll_fn(|cx| -> Poll<Result<(), Error>> {
             let r = T::regs();
             T::state().tx_waker.register(cx.waker());
             if r.sts().read().tdc().bit_is_set() {
                 Poll::Ready(Ok(()))
             } else {
+                r.ctrl1().modify(|_, w| w.tdcien().enable());
                 Poll::Pending
             }
         })
@@ -666,6 +756,9 @@ impl<'d, T: Instance> UartRx<'d, T, mode::Async> {
                 if r.sts().read().rdbf().bit_is_set() {
                     Poll::Ready(r.dt().read().bits() as u8)
                 } else {
+                    // Arm the RDBF interrupt while pending (the ISR disables
+                    // it when it wakes us).
+                    r.ctrl1().modify(|_, w| w.rdbfien().enable());
                     Poll::Pending
                 }
             })
@@ -682,7 +775,10 @@ impl<'d, T: Instance> UartTx<'d, T, mode::Blocking> {
         tx: Peri<'d, impl TxPin<T>>,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let tx_pin = new_pin!(tx, AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None));
+        let tx_pin = new_pin!(
+            tx,
+            AfType::output(OutputType::PushPull, Speed::High.into(), Pull::None)
+        );
         T::enable_and_reset();
         configure(T::regs(), &config, T::frequency(), true, false)?;
         Ok(Self {

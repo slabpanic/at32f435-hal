@@ -1,0 +1,33 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: thumbv7em-none-eabihf
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features embassy,time-driver-tim2,exti,usb,defmt -- -D warnings
+      - run: cargo check --locked --no-default-features
+      - run: cargo test --locked --no-default-features --lib --target x86_64-unknown-linux-gnu
+      - run: cargo build --locked --release -p at32f435cgt7-examples --bins
+      - run: cargo build --locked --release -p at32f435cgt7-examples --no-default-features --features time-driver-tim2 --bin blink
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features usb,defmt
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.87.0
+          targets: thumbv7em-none-eabihf
+      - run: cargo check --locked --workspace

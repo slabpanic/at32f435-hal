@@ -6,7 +6,7 @@
 //! an embassy time driver (SysTick by default, TMR2 optional), and `bind_interrupts!`
 //! interrupt-binding infrastructure.
 //!
-//! Typical usage (the RGB breathing LED from evb_at32f435cgt7):
+//! Typical usage (an LED on PA0):
 //! ```ignore
 //! #![no_std]
 //! #![no_main]
@@ -36,7 +36,7 @@
 //! The application also needs: `embassy-executor`, `embassy-time` (pick one
 //! `generic-queue-N`), cortex-m's `critical-section-single-core` (force-enabled by the HAL),
 //! cortex-m-rt (already included via the HAL's `rt` feature), and linker scripts
-//! (the application project supplies its own memory.x + link.x).
+//! (the application supplies memory.x and links cortex-m-rt's link.x).
 //!
 //! ## Key differences from going HAL-less
 //! - `at32f4xx_pac::Peripherals::take()/steal()` is never touched: HAL peripheral
@@ -62,13 +62,9 @@ compile_error!("time-driver-systick and time-driver-tim2 are mutually exclusive;
     feature = "embassy",
     not(any(feature = "time-driver-systick", feature = "time-driver-tim2"))
 ))]
-compile_error!("the embassy feature requires a time driver: enable time-driver-systick or time-driver-tim2");
-
-#[cfg(all(feature = "embassy", feature = "time-driver-systick", not(feature = "rt")))]
-compile_error!("time-driver-systick depends on rt (the SysTick exception must be registered via cortex-m-rt)");
-
-#[cfg(all(feature = "embassy", feature = "time-driver-tim2", not(feature = "rt")))]
-compile_error!("time-driver-tim2 depends on rt (the TMR2 interrupt must be registered via cortex-m-rt)");
+compile_error!(
+    "the embassy feature requires a time driver: enable time-driver-systick or time-driver-tim2"
+);
 
 pub use at32f4xx_pac::at32f435 as pac;
 pub use embassy_hal_internal;
@@ -82,14 +78,31 @@ pub use cortex_m_rt::{entry, interrupt};
 #[macro_use]
 mod macros;
 
+pub mod acc;
+pub mod adc;
+pub mod can;
+pub mod crc;
+pub mod dac;
+pub mod debug;
 pub mod delay;
+pub mod dma;
+pub mod edma;
+pub mod ertc;
+pub mod flash;
 pub mod gpio;
+pub mod i2c;
+pub mod i2s;
 pub mod interrupt;
+pub mod irtmr;
+pub mod pwc;
 pub mod rcc;
+pub mod scfg;
+pub mod spi;
 pub mod time;
 pub mod timer;
 pub mod usart;
 pub mod wdg;
+pub mod wwdt;
 
 #[cfg(feature = "usb")]
 pub mod usb;
@@ -99,29 +112,246 @@ pub mod exti;
 mod peripheral;
 pub use peripheral::RccPeripheral;
 
-#[cfg(feature = "embassy")]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "time-driver-systick", feature = "time-driver-tim2")
+))]
 pub mod embassy;
 
 embassy_hal_internal::peripherals!(
     // GPIO pin singletons (port*16+pin encoded into AnyPin)
-    PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7, PA8, PA9, PA10, PA11, PA12, PA13, PA14, PA15, //
-    PB0, PB1, PB2, PB3, PB4, PB5, PB6, PB7, PB8, PB9, PB10, PB11, PB12, PB13, PB14, PB15, //
-    PC0, PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10, PC11, PC12, PC13, PC14, PC15, //
-    PD0, PD1, PD2, PD3, PD4, PD5, PD6, PD7, PD8, PD9, PD10, PD11, PD12, PD13, PD14, PD15, //
-    PE0, PE1, PE2, PE3, PE4, PE5, PE6, PE7, PE8, PE9, PE10, PE11, PE12, PE13, PE14, PE15, //
-    PF0, PF1, PF2, PF3, PF4, PF5, PF6, PF7, PF8, PF9, PF10, PF11, PF12, PF13, PF14, PF15, //
-    PG0, PG1, PG2, PG3, PG4, PG5, PG6, PG7, PG8, PG9, PG10, PG11, PG12, PG13, PG14, PG15, //
-    PH0, PH1, PH2, PH3, PH4, PH5, PH6, PH7, PH8, PH9, PH10, PH11, PH12, PH13, PH14, PH15, //
+    PA0,
+    PA1,
+    PA2,
+    PA3,
+    PA4,
+    PA5,
+    PA6,
+    PA7,
+    PA8,
+    PA9,
+    PA10,
+    PA11,
+    PA12,
+    PA13,
+    PA14,
+    PA15, //
+    PB0,
+    PB1,
+    PB2,
+    PB3,
+    PB4,
+    PB5,
+    PB6,
+    PB7,
+    PB8,
+    PB9,
+    PB10,
+    PB11,
+    PB12,
+    PB13,
+    PB14,
+    PB15, //
+    PC0,
+    PC1,
+    PC2,
+    PC3,
+    PC4,
+    PC5,
+    PC6,
+    PC7,
+    PC8,
+    PC9,
+    PC10,
+    PC11,
+    PC12,
+    PC13,
+    PC14,
+    PC15, //
+    PD0,
+    PD1,
+    PD2,
+    PD3,
+    PD4,
+    PD5,
+    PD6,
+    PD7,
+    PD8,
+    PD9,
+    PD10,
+    PD11,
+    PD12,
+    PD13,
+    PD14,
+    PD15, //
+    PE0,
+    PE1,
+    PE2,
+    PE3,
+    PE4,
+    PE5,
+    PE6,
+    PE7,
+    PE8,
+    PE9,
+    PE10,
+    PE11,
+    PE12,
+    PE13,
+    PE14,
+    PE15, //
+    PF0,
+    PF1,
+    PF2,
+    PF3,
+    PF4,
+    PF5,
+    PF6,
+    PF7,
+    PF8,
+    PF9,
+    PF10,
+    PF11,
+    PF12,
+    PF13,
+    PF14,
+    PF15, //
+    PG0,
+    PG1,
+    PG2,
+    PG3,
+    PG4,
+    PG5,
+    PG6,
+    PG7,
+    PG8,
+    PG9,
+    PG10,
+    PG11,
+    PG12,
+    PG13,
+    PG14,
+    PG15, //
+    PH0,
+    PH1,
+    PH2,
+    PH3,
+    PH4,
+    PH5,
+    PH6,
+    PH7,
+    PH8,
+    PH9,
+    PH10,
+    PH11,
+    PH12,
+    PH13,
+    PH14,
+    PH15, //
     // Named peripheral singletons
-    CRM, PWC, FLASH, SCFG, EXINT, EDMA, DMA1, DMA2, SDIO1, SDIO2, ERTC, WDT, WWDT, //
+    CRM,
+    PWC,
+    FLASH,
+    SCFG,
+    DEBUG,
+    EXINT,
+    DMA1,
+    DMA2,
+    SDIO1,
+    SDIO2,
+    ERTC,
+    WDT,
+    WWDT, //
+    // DMA channel singletons (DMA1/DMA2 each 7 channels, own NVIC lines)
+    DMA1_CH1,
+    DMA1_CH2,
+    DMA1_CH3,
+    DMA1_CH4,
+    DMA1_CH5,
+    DMA1_CH6,
+    DMA1_CH7, //
+    DMA2_CH1,
+    DMA2_CH2,
+    DMA2_CH3,
+    DMA2_CH4,
+    DMA2_CH5,
+    DMA2_CH6,
+    DMA2_CH7, //
     // EXINT channel singletons (line number = GPIO pin number; lines 16-22 are internal wakeup sources and have no singletons)
-    EXINT0, EXINT1, EXINT2, EXINT3, EXINT4, EXINT5, EXINT6, EXINT7, //
-    EXINT8, EXINT9, EXINT10, EXINT11, EXINT12, EXINT13, EXINT14, EXINT15, //
-    TMR1, TMR2, TMR3, TMR4, TMR5, TMR6, TMR7, TMR8, TMR9, TMR10, TMR11, TMR12, TMR13, TMR14, TMR20, //
-    ACC, I2C1, I2C2, I2C3, SPI1, SPI2, SPI3, SPI4, //
-    USART1, USART2, USART3, USART6, UART4, UART5, UART7, UART8, //
-    ADC1, ADC2, ADC3, ADCCOM, CAN1, CAN2, DAC, CRC, DVP, //
-    USB_OTG1, USB_OTG2, QSPI1, QSPI2, XMC
+    EXINT0,
+    EXINT1,
+    EXINT2,
+    EXINT3,
+    EXINT4,
+    EXINT5,
+    EXINT6,
+    EXINT7, //
+    EXINT8,
+    EXINT9,
+    EXINT10,
+    EXINT11,
+    EXINT12,
+    EXINT13,
+    EXINT14,
+    EXINT15, //
+    TMR1,
+    TMR2,
+    TMR3,
+    TMR4,
+    TMR5,
+    TMR6,
+    TMR7,
+    TMR8,
+    TMR9,
+    TMR10,
+    TMR11,
+    TMR12,
+    TMR13,
+    TMR14,
+    TMR20, //
+    ACC,
+    I2C1,
+    I2C2,
+    I2C3,
+    SPI1,
+    SPI2,
+    SPI3,
+    SPI4, //
+    USART1,
+    USART2,
+    USART3,
+    USART6,
+    UART4,
+    UART5,
+    UART7,
+    UART8, //
+    // EDMA stream singletons (8 streams, own NVIC lines)
+    EDMA_STREAM1,
+    EDMA_STREAM2,
+    EDMA_STREAM3,
+    EDMA_STREAM4, //
+    EDMA_STREAM5,
+    EDMA_STREAM6,
+    EDMA_STREAM7,
+    EDMA_STREAM8, //
+    EDMA,
+    ADC1,
+    ADC2,
+    ADC3,
+    ADCCOM,
+    CAN1,
+    CAN2,
+    DAC,
+    CRC,
+    DVP, //
+    // I2S full-duplex companion blocks (same CRM gate + NVIC line as their parent SPI)
+    I2S2_EXT,
+    I2S3_EXT, //
+    USB_OTG1,
+    USB_OTG2,
+    QSPI1,
+    QSPI2,
+    XMC
 );
 
 /// Global initialization: takes the peripheral singletons (once), configures the clock tree,
@@ -136,7 +366,10 @@ pub fn init(config: impl Into<Config>) -> Peripherals {
     rcc::enable_scfg_clock();
     #[cfg(feature = "exti")]
     exti::init();
-    #[cfg(feature = "embassy")]
+    #[cfg(all(
+        feature = "embassy",
+        any(feature = "time-driver-systick", feature = "time-driver-tim2")
+    ))]
     embassy::init();
 
     p
@@ -160,7 +393,7 @@ impl From<rcc::Config> for Config {
 /// use at32f435_hal as hal;
 ///
 /// bind_interrupts!(struct Irqs {
-///     USART1 => hal::usart::InterruptHandler<hal::pac::USART1>;
+///     USART1 => hal::usart::InterruptHandler<hal::peripherals::USART1>;
 /// });
 /// ```
 ///

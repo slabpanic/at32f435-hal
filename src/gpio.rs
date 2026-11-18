@@ -108,11 +108,8 @@ impl AfType {
     }
 }
 
-/// IOMC field values (PAC enum: Input=0/Output=1/Multiplexed=2/Analog=3).
-/// `Multiplexed` is reserved for future alternate-function peripheral drivers
-/// (usart/spi etc.); no callers yet.
+/// GPIO mode field written by the pin configuration methods.
 #[derive(Copy, Clone)]
-#[allow(dead_code)]
 pub(crate) enum Iomc {
     Input,
     Output,
@@ -232,34 +229,42 @@ pub(crate) trait SealedPin {
     /// avoid a glitch during the transition.
     #[inline]
     fn set_as_output(&self, ot: OutputType, drive: Drive, level: Level, pull: Pull) {
-        match level {
-            Level::High => self.set_high(),
-            Level::Low => self.set_low(),
-        }
-        self.set_output_type(ot);
-        self.set_drive(drive);
-        self.set_iomc(Iomc::Output, pull);
+        critical_section::with(|_| {
+            match level {
+                Level::High => self.set_high(),
+                Level::Low => self.set_low(),
+            }
+            self.set_output_type(ot);
+            self.set_drive(drive);
+            self.set_iomc(Iomc::Output, pull);
+        });
     }
 
     #[inline]
     fn set_as_input(&self, pull: Pull) {
-        self.set_iomc(Iomc::Input, pull);
+        critical_section::with(|_| {
+            self.set_iomc(Iomc::Input, pull);
+        });
     }
 
     /// Configure as alternate function: write the AF number + output
     /// type/drive strength + IOMC.
     #[inline]
     fn set_as_af(&self, af: u8, af_type: AfType) {
-        self.set_mux(af);
-        self.set_output_type(af_type.output_type);
-        self.set_drive(af_type.drive);
-        self.set_iomc(Iomc::Multiplexed, af_type.pull);
+        critical_section::with(|_| {
+            self.set_mux(af);
+            self.set_output_type(af_type.output_type);
+            self.set_drive(af_type.drive);
+            self.set_iomc(Iomc::Multiplexed, af_type.pull);
+        });
     }
 
     /// Disconnect: analog state (no digital peripheral attached, no pull).
     #[inline]
     fn set_as_analog(&self) {
-        self.set_iomc(Iomc::Analog, Pull::None);
+        critical_section::with(|_| {
+            self.set_iomc(Iomc::Analog, Pull::None);
+        });
     }
 }
 
@@ -422,11 +427,13 @@ impl<'d> Input<'d> {
 
     /// Pin number (crate-internal: ExtiInput needs it to line up with the
     /// EXINT line number).
+    #[cfg(feature = "exti")]
     pub(crate) fn pin_no(&self) -> u8 {
         SealedPin::pin(&*self.pin)
     }
 
     /// Port number (crate-internal).
+    #[cfg(feature = "exti")]
     pub(crate) fn port_no(&self) -> u8 {
         SealedPin::port(&*self.pin)
     }

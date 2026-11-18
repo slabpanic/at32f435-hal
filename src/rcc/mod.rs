@@ -9,15 +9,19 @@
 //! >108 MHz) -> switch SCLK to the target source.
 //!
 //! WARNING: The FLASH `DIVR.FDIV` encoding is unusual (per the Artery firmware
-//! library's `flash_clock_divider_type`): `0b00`=/2, `0b01`=/3, `0b10`=/4  - 
+//! library's `flash_clock_divider_type`): `0b00`=/2, `0b01`=/3, `0b10`=/4  -
 //! there is **no /1**. At 288 MHz, /3 gives 96 MHz <= 104 MHz.
 
-use crate::peripheral::RccPeripheral;
-use crate::time::Hertz;
+mod config;
+pub use config::{AhbDiv, ApbDiv, Config, Hext, Pll, PllFr, PllSource, Sysclk};
 
-/// HICK (internal high-speed clock) frequency: 48 MHz. The system clock runs
-/// on HICK after reset.
+use crate::peripheral::{ClockControl, RccPeripheral};
+use crate::time::Hertz;
+use embassy_sync::once_lock::OnceLock;
+
+/// Undivided internal high-speed oscillator frequency.
 pub const HICK_FREQ: Hertz = Hertz(48_000_000);
+const HICK_DIV6: Hertz = Hertz(8_000_000);
 
 /// FLASH interface clock limit (RM): the automatic divider targets this.
 const FLASH_CLK_MAX: u32 = 104_000_000;
@@ -29,186 +33,6 @@ const AUTO_STEP_THRESHOLD: u32 = 108_000_000;
 const SYSCLK_MAX: u32 = 288_000_000;
 /// APB1/APB2 bus limit.
 const APB_MAX: u32 = 144_000_000;
-
-/// HEXT (external high-speed crystal/clock source) configuration.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Hext {
-    /// Crystal/input frequency.
-    pub freq: Hertz,
-    /// true = bypass mode (external active clock), false = on-board crystal.
-    pub bypass: bool,
-}
-
-/// System clock source.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Sysclk {
-    /// HICK 48 MHz (reset default).
-    Hick,
-    /// HEXT used directly as the system clock.
-    Hext,
-    /// PLL output (requires the `pll` field).
-    Pll,
-}
-
-/// PLL reference source. v1 only exposes HEXT (the HICK path will be added
-/// once verified against the RM).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PllSource {
-    /// HEXT, prescaled by PLL_MS before entering the PLL.
-    Hext,
-}
-
-/// PLL post-divider (FR field): 0b00=/1, 0b01=/2, 0b10=/4, 0b11=/8.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PllFr {
-    Div1,
-    Div2,
-    Div4,
-    Div8,
-}
-
-impl PllFr {
-    /// PAC encoding of the FR field.
-    const fn bits(self) -> u8 {
-        match self {
-            PllFr::Div1 => 0b00,
-            PllFr::Div2 => 0b01,
-            PllFr::Div4 => 0b10,
-            PllFr::Div8 => 0b11,
-        }
-    }
-
-    /// Divider factor.
-    const fn factor(self) -> u32 {
-        match self {
-            PllFr::Div1 => 1,
-            PllFr::Div2 => 2,
-            PllFr::Div4 => 4,
-            PllFr::Div8 => 8,
-        }
-    }
-}
-
-/// PLL configuration: output = reference / MS * NS / FR.
-/// RM constraint: the reference input after /MS must be 2-16 MHz.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Pll {
-    pub source: PllSource,
-    /// Multiplier (NS field, 9 bits).
-    pub ns: u16,
-    /// Prescaler (MS field, 4 bits, >=1).
-    pub ms: u8,
-    /// Post-divider (FR field).
-    pub fr: PllFr,
-}
-
-/// AHB divider (AHBDIV field).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AhbDiv {
-    Div1,
-    Div2,
-    Div4,
-    Div8,
-    Div16,
-    Div64,
-    Div128,
-    Div256,
-    Div512,
-}
-
-impl AhbDiv {
-    const fn factor(self) -> u32 {
-        match self {
-            AhbDiv::Div1 => 1,
-            AhbDiv::Div2 => 2,
-            AhbDiv::Div4 => 4,
-            AhbDiv::Div8 => 8,
-            AhbDiv::Div16 => 16,
-            AhbDiv::Div64 => 64,
-            AhbDiv::Div128 => 128,
-            AhbDiv::Div256 => 256,
-            AhbDiv::Div512 => 512,
-        }
-    }
-}
-
-/// APB1/APB2 divider (limit 144 MHz; when the divider is > 1, timer clocks on
-/// that APB are 2x).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ApbDiv {
-    Div1,
-    Div2,
-    Div4,
-    Div8,
-    Div16,
-}
-
-impl ApbDiv {
-    const fn factor(self) -> u32 {
-        match self {
-            ApbDiv::Div1 => 1,
-            ApbDiv::Div2 => 2,
-            ApbDiv::Div4 => 4,
-            ApbDiv::Div8 => 8,
-            ApbDiv::Div16 => 16,
-        }
-    }
-}
-
-/// Clock tree configuration. Start from [`Config::DEFAULT`] (HICK 48 MHz) or
-/// one of the presets, then tweak fields as needed.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Config {
-    /// HEXT configuration; required when HEXT/PLL is used.
-    pub hext: Option<Hext>,
-    /// Target system clock source.
-    pub sys: Sysclk,
-    /// PLL configuration; required when `sys == Sysclk::Pll`.
-    pub pll: Option<Pll>,
-    /// AHB divider.
-    pub ahb_pre: AhbDiv,
-    /// APB1 divider.
-    pub apb1_pre: ApbDiv,
-    /// APB2 divider.
-    pub apb2_pre: ApbDiv,
-}
-
-impl Config {
-    /// Reset-default clocks: the whole tree at 48 MHz (HICK), no registers written.
-    pub const DEFAULT: Config = Config {
-        hext: None,
-        sys: Sysclk::Hick,
-        pll: None,
-        ahb_pre: AhbDiv::Div1,
-        apb1_pre: ApbDiv::Div1,
-        apb2_pre: ApbDiv::Div1,
-    };
-
-    /// HEXT 8 MHz crystal -> PLL * 144/(1*4) -> 288 MHz, AHB=288, APB1=APB2=144.
-    /// On-board preset for the evb_at32f435cgt7 (validated on hardware).
-    pub const SYSCLK_FREQ_288MHZ_HEXT_8M: Config = Config {
-        hext: Some(Hext {
-            freq: Hertz(8_000_000),
-            bypass: false,
-        }),
-        sys: Sysclk::Pll,
-        pll: Some(Pll {
-            source: PllSource::Hext,
-            ns: 144,
-            ms: 1,
-            fr: PllFr::Div4,
-        }),
-        ahb_pre: AhbDiv::Div1,
-        apb1_pre: ApbDiv::Div2,
-        apb2_pre: ApbDiv::Div2,
-    };
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config::DEFAULT
-    }
-}
 
 /// Global clock snapshot: valid after `init()` succeeds; drivers read it on demand.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -227,25 +51,20 @@ pub struct Clocks {
     pub pclk2_tim: Hertz,
 }
 
-static mut CLOCKS: Clocks = Clocks {
-    sysclk: HICK_FREQ,
-    hclk: HICK_FREQ,
-    pclk1: HICK_FREQ,
-    pclk2: HICK_FREQ,
-    pclk1_tim: HICK_FREQ,
-    pclk2_tim: HICK_FREQ,
+static CLOCKS: OnceLock<Clocks> = OnceLock::new();
+const RESET_CLOCKS: Clocks = Clocks {
+    sysclk: HICK_DIV6,
+    hclk: HICK_DIV6,
+    pclk1: HICK_DIV6,
+    pclk2: HICK_DIV6,
+    pclk1_tim: HICK_DIV6,
+    pclk2_tim: HICK_DIV6,
 };
 
-/// Current clock configuration (reset default 48 MHz before `init()`).
+/// Current clock configuration (reset default 8 MHz before `init()`).
 #[inline]
 pub fn clocks() -> &'static Clocks {
-    unsafe { core::ptr::addr_of!(CLOCKS).as_ref().unwrap() }
-}
-
-fn set_clocks(clocks: Clocks) {
-    unsafe {
-        core::ptr::addr_of_mut!(CLOCKS).write(clocks);
-    }
+    CLOCKS.try_get().unwrap_or(&RESET_CLOCKS)
 }
 
 /// Ready-flag wait with a timeout panic (context included for easier debugging).
@@ -262,12 +81,26 @@ fn crm() -> &'static crate::pac::crm::RegisterBlock {
     unsafe { &*crate::pac::CRM::PTR }
 }
 
+// HICK_TO_SCLK must be set before writing HICKDIV. Restore the fixed
+// 8 MHz system clock path if SCLK will be switched to PLL.
+fn select_hick_48m(use_as_sysclk: bool) {
+    let misc1 = crm().misc1();
+    misc1.modify(|_, w| w.hick_to_sclk().set_bit());
+    cortex_m::asm::isb();
+    misc1.modify(|_, w| w.hickdiv().set_bit());
+    cortex_m::asm::isb();
+    misc1.modify(|_, w| w.hick_to_sclk().bit(use_as_sysclk));
+    cortex_m::asm::isb();
+}
+
 /// Enable the clocks of all GPIO ports (AT32 GPIOs hang off AHB:
 /// CRM_AHBEN1 bits 0..7 = GPIOA..GPIOH).
 /// Called once from `hal::init()`; pin-level drivers no longer toggle port
 /// clocks individually.
 pub(crate) fn enable_gpio_clocks() {
-    crm().ahben1().modify(|r, w| unsafe { w.bits(r.bits() | 0xFF) });
+    crm()
+        .ahben1()
+        .modify(|r, w| unsafe { w.bits(r.bits() | 0xFF) });
 }
 
 /// Enable the SCFG clock (APB2): needed for muxing config such as EXINT port
@@ -279,45 +112,20 @@ pub(crate) fn enable_scfg_clock() {
 /// Apply the clock configuration. Must be called once after
 /// `Peripherals::take()` and before any task/driver consumes the clocks
 /// (`hal::init()` already takes care of this).
-pub fn init(config: Config) {
+pub(crate) fn init(config: Config) {
     let crm = crm();
     let flash = unsafe { &*crate::pac::FLASH::PTR };
 
-    // ---- Target frequency computation and validation (before touching registers) ----
-    let pll_hz = config.pll.map(|pll| {
-        let src = match pll.source {
-            PllSource::Hext => config
-                .hext
-                .expect("config.hext must be set when sys=Pll and pll.source=Hext"),
-        };
-        assert!((1..=15).contains(&pll.ms), "the PLL_MS field is 4 bits and must be >= 1");
-        assert!(pll.ns >= 2, "PLL_NS must be >= 2");
-        let ref_hz = src.freq.0 / pll.ms as u32;
-        assert!(
-            (2_000_000..=16_000_000).contains(&ref_hz),
-            "PLL input after prescaling must be 2-16 MHz (currently {ref_hz} Hz)"
-        );
-        // u64 intermediate: ref*ns can exceed the u32 range
-        ((ref_hz as u64 * pll.ns as u64) / pll.fr.factor() as u64) as u32
-    });
-    let sysclk = match config.sys {
-        Sysclk::Hick => HICK_FREQ,
-        Sysclk::Hext => config.hext.expect("config.hext must be set when sys=Hext").freq,
-        Sysclk::Pll => Hertz(pll_hz.expect("config.pll must be set when sys=Pll")),
-    };
-    assert!(sysclk.0 <= SYSCLK_MAX, "sysclk exceeds the AT32F435 limit of 288 MHz");
-    let hclk = Hertz(sysclk.0 / config.ahb_pre.factor());
-    let pclk1 = Hertz(hclk.0 / config.apb1_pre.factor());
-    let pclk2 = Hertz(hclk.0 / config.apb2_pre.factor());
-    assert!(pclk1.0 <= APB_MAX, "APB1 exceeds the 144 MHz limit");
-    assert!(pclk2.0 <= APB_MAX, "APB2 exceeds the 144 MHz limit");
+    let clocks = config.clocks();
+    let sysclk = clocks.sysclk;
 
     // ---- LDO 1.3 V (required above 240 MHz; done while SCLK is still on
     // HICK/HEXT, which is the state right after reset) ----
     if sysclk.0 > HI_FREQ_THRESHOLD {
-        crm.apb1en().modify(|_, w| w.pwc().set_bit());
+        enable_pwc_clock();
         let pwc = unsafe { &*crate::pac::PWC::PTR };
-        pwc.ldoov().modify(|_, w| unsafe { w.ldoovsel().bits(0b001) });
+        pwc.ldoov()
+            .modify(|_, w| unsafe { w.ldoovsel().bits(0b001) });
     }
 
     // ---- FLASH clock divider: pick the smallest of {/2, /3, /4} keeping
@@ -328,8 +136,14 @@ pub fn init(config: Config) {
         .find(|(_, div)| sysclk.0 / div <= FLASH_CLK_MAX)
         .map(|(code, div)| (code, sysclk.0 / div))
         .unwrap_or((2, sysclk.0 / 4));
-    assert!(flash_hz <= FLASH_CLK_MAX, "no compliant flash divider found for {} Hz", sysclk.0);
-    flash.divr().modify(|_, w| unsafe { w.fdiv().bits(fdiv_code) });
+    assert!(
+        flash_hz <= FLASH_CLK_MAX,
+        "no compliant flash divider found for {} Hz",
+        sysclk.0
+    );
+    flash
+        .divr()
+        .modify(|_, w| unsafe { w.fdiv().bits(fdiv_code) });
     // Step 3 of the RM "LDO output voltage regulation" flow: NZW_BST goes
     // together with DIVR; omitting it causes sporadic flash access errors and
     // runaway execution at high frequencies (observed on the evb board).
@@ -344,7 +158,9 @@ pub fn init(config: Config) {
         _ => false,
     };
     if hext_used {
-        let hext = config.hext.expect("config.hext must be set when sys=Hext or PLL(HEXT)");
+        let hext = config
+            .hext
+            .expect("config.hext must be set when sys=Hext or PLL(HEXT)");
         crm.ctrl().modify(|_, w| {
             w.hexten().set_bit();
             if hext.bypass {
@@ -358,11 +174,34 @@ pub fn init(config: Config) {
         );
     }
 
+    if config.sys == Sysclk::Hick {
+        // The reset SCLK path provides 8 MHz. Select the undivided HICK
+        // explicitly to obtain the 48 MHz promised by Config::DEFAULT.
+        select_hick_48m(true);
+    }
+
     // ---- PLL configuration + enable + lock wait ----
-    if let Some(pll) = config.pll {
+    if config.sys == Sysclk::Pll {
+        let pll = config.pll.expect("PLL configuration was validated");
+        if pll.source == PllSource::Hick {
+            // The PLL reference on the HICK path is the divided 8 MHz clock;
+            // the HICK must be stable before the PLL can lock (the reset
+            // default HICKEN=1 starts it, but the ready wait is still
+            // required - observed on the evb: without this wait the PLL
+            // never locks).
+            wait_with_timeout(
+                || crm.ctrl().read().hickstbl().bit_is_set(),
+                "HICK failed to start",
+            );
+            // Keep SCLK on the fixed 8 MHz path until switching to the PLL.
+            // The PLL's HICK reference is 8 MHz with this sequence, as in
+            // the vendor's crm_pll_config and crm_clocks_freq_get.
+            select_hick_48m(false);
+        }
         crm.pllcfg().write(|w| {
             match pll.source {
                 PllSource::Hext => w.pllrcs().set_bit(),
+                PllSource::Hick => w.pllrcs().clear_bit(),
             };
             unsafe {
                 w.pll_ns().bits(pll.ns);
@@ -372,7 +211,10 @@ pub fn init(config: Config) {
             w
         });
         crm.ctrl().modify(|_, w| w.pllen().set_bit());
-        wait_with_timeout(|| crm.ctrl().read().pllstbl().bit_is_set(), "PLL failed to lock");
+        wait_with_timeout(
+            || crm.ctrl().read().pllstbl().bit_is_set(),
+            "PLL failed to lock",
+        );
     }
 
     // ---- Bus dividers: AHB, APB1, APB2 ----
@@ -405,52 +247,84 @@ pub fn init(config: Config) {
         w
     });
 
-    // ---- Smooth switching (required for PLL > 108 MHz): the flash controller
-    // automatically slows down during the switch ----
-    if sysclk.0 > AUTO_STEP_THRESHOLD {
+    switch_system_clock(config.sys, sysclk.0 > AUTO_STEP_THRESHOLD);
+    CLOCKS.init(clocks).expect("clocks initialized twice");
+}
+
+pub(crate) fn enable_pwc_clock() {
+    critical_section::with(|_| {
+        let crm = crm();
+        crm.apb1en().modify(|_, w| w.pwc().set_bit());
+        let _ = crm.apb1en().read();
+    });
+}
+
+pub(crate) fn active_system_clock() -> Sysclk {
+    let status = crm().cfg().read().sclksts();
+    if status.is_pll() {
+        Sysclk::Pll
+    } else if status.is_hext() {
+        Sysclk::Hext
+    } else {
+        Sysclk::Hick
+    }
+}
+
+fn switch_system_clock(source: Sysclk, smooth: bool) {
+    let crm = crm();
+    if smooth {
         crm.misc2()
             .modify(|_, w| unsafe { w.auto_step_en().bits(0b11) });
     }
-
-    // ---- Switch the system clock + wait for it to take effect ----
-    match config.sys {
+    match source {
         Sysclk::Hick => crm.cfg().modify(|_, w| w.sclksel().hick()),
         Sysclk::Hext => crm.cfg().modify(|_, w| w.sclksel().hext()),
         Sysclk::Pll => crm.cfg().modify(|_, w| w.sclksel().pll()),
     };
     wait_with_timeout(
-        || match config.sys {
-            Sysclk::Hick => crm.cfg().read().sclksts().is_hick(),
-            Sysclk::Hext => crm.cfg().read().sclksts().is_hext(),
-            Sysclk::Pll => crm.cfg().read().sclksts().is_pll(),
-        },
+        || active_system_clock() == source,
         "SCLK switch did not take effect",
     );
-
-    if sysclk.0 > AUTO_STEP_THRESHOLD {
+    if smooth {
         crm.misc2()
             .modify(|_, w| unsafe { w.auto_step_en().bits(0b00) });
     }
+}
 
-    // ---- Record the clock snapshot (timer clocks: 2x when the APB divider > 1) ----
-    let pclk1_tim = Hertz(if config.apb1_pre == ApbDiv::Div1 {
-        pclk1.0
-    } else {
-        pclk1.0 * 2
-    });
-    let pclk2_tim = Hertz(if config.apb2_pre == ApbDiv::Div1 {
-        pclk2.0
-    } else {
-        pclk2.0 * 2
-    });
-    set_clocks(Clocks {
-        sysclk,
-        hclk,
-        pclk1,
-        pclk2,
-        pclk1_tim,
-        pclk2_tim,
-    });
+pub(crate) fn switch_to_hick_for_deepsleep() {
+    let crm = crm();
+    crm.ctrl().modify(|_, w| w.hicken().set_bit());
+    wait_with_timeout(
+        || crm.ctrl().read().hickstbl().bit_is_set(),
+        "HICK failed to start",
+    );
+    switch_system_clock(Sysclk::Hick, false);
+}
+
+pub(crate) fn restore_after_deepsleep(source: Sysclk) {
+    if active_system_clock() == source {
+        return;
+    }
+    // Dividers and PLL parameters are retained. The oscillator and PLL
+    // need to be restarted and stable before SCLK can switch back (RM 3.6).
+    let crm = crm();
+    if source == Sysclk::Hext
+        || (source == Sysclk::Pll && crm.pllcfg().read().pllrcs().bit_is_set())
+    {
+        crm.ctrl().modify(|_, w| w.hexten().set_bit());
+        wait_with_timeout(
+            || crm.ctrl().read().hextstbl().bit_is_set(),
+            "HEXT failed to restart",
+        );
+    }
+    if source == Sysclk::Pll {
+        crm.ctrl().modify(|_, w| w.pllen().set_bit());
+        wait_with_timeout(
+            || crm.ctrl().read().pllstbl().bit_is_set(),
+            "PLL failed to relock",
+        );
+    }
+    switch_system_clock(source, clocks().sysclk.0 > AUTO_STEP_THRESHOLD);
 }
 
 /// `RccPeripheral` macro table: for each named peripheral, (enable register,
@@ -468,6 +342,9 @@ macro_rules! impl_rcc {
                     crate::rcc::clocks().$freq
                 }
 
+            }
+
+            impl ClockControl for crate::peripherals::$peri {
                 fn enable_and_reset() {
                     critical_section::with(|_| {
                         let crm = unsafe { &*crate::pac::CRM::PTR };
@@ -516,7 +393,9 @@ impl_rcc! {
     TMR14    => (apb1en, tmr14,   apb1rst, tmr14,   pclk1_tim),
     WWDT     => (apb1en, wwdt,    apb1rst, wwdt,    pclk1),
     SPI2     => (apb1en, spi2,    apb1rst, spi2,    pclk1),
+    I2S2_EXT => (apb1en, spi2,    apb1rst, spi2,    pclk1),
     SPI3     => (apb1en, spi3,    apb1rst, spi3,    pclk1),
+    I2S3_EXT => (apb1en, spi3,    apb1rst, spi3,    pclk1),
     USART2   => (apb1en, usart2,  apb1rst, usart2,  pclk1),
     USART3   => (apb1en, usart3,  apb1rst, usart3,  pclk1),
     UART4    => (apb1en, uart4,   apb1rst, uart4,   pclk1),

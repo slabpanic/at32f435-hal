@@ -13,11 +13,11 @@
 //! Applications must bring their own `embassy-time` dependency (pick one
 //! `generic-queue-N` feature to set the queue capacity).
 
-#[cfg(feature = "time-driver-systick")]
+#[cfg(all(feature = "time-driver-systick", not(feature = "time-driver-tim2")))]
 #[path = "time_driver_systick.rs"]
 mod time_driver;
 
-#[cfg(all(feature = "time-driver-tim2", not(feature = "time-driver-systick")))]
+#[cfg(feature = "time-driver-tim2")]
 #[path = "time_driver_tmr.rs"]
 mod time_driver;
 
@@ -29,4 +29,14 @@ pub(crate) fn init() {
 /// `defmt::timestamp!("{=u64:us}", at32f435_hal::embassy::now_us());`
 pub fn now_us() -> u64 {
     time_driver::now_us()
+}
+
+// Split the seconds and fractional parts to avoid overflowing in the
+// intermediate multiplication during a long-running session.
+fn scale(value: u64, from_hz: u64, to_hz: u64) -> u64 {
+    if from_hz == to_hz {
+        value
+    } else {
+        (value / from_hz) * to_hz + ((value % from_hz) * to_hz) / from_hz
+    }
 }
