@@ -12,23 +12,24 @@
 //!   figures 11-8/11-9) and SMBus master PEC transfers
 //!   (`blocking_smbus_write_pec`/`blocking_smbus_read_pec`, RM 11.4.6 - the
 //!   hardware appends/checks the PEC byte) live on the blocking driver; the
-//!   SMBus timeout detector comes via `configure_smbus_timeout`. Those
-//!   three groups are compile-validated only (no such device on the evb).
+//!   SMBus timeout detector comes via `configure_smbus_timeout`.
 //! - [`I2cDma`]: DMA-driven master (async). Data moves over DMA (TXDT/RXDT);
 //!   the EVT and ERR handlers wake the transfer on bus events and errors.
 //! - Timing: CLKCTRL is computed from PCLK1 (tHIGH = (SCLH+1)*(DIV+1)*Ti2c,
 //!   tLOW = (SCLL+1)*(DIV+1)*Ti2c, RM 11.4.3). Pass `Config::clkctrl` to set
 //!   the raw register value instead (e.g. from Artery's timing tool).
 //!
-//! Pins are open-drain alternate functions; external pull-ups are expected
-//! (use `Pull::Up` at the driver level if the board lacks them).
+//! Pins are open-drain alternate functions. Use external pull-ups for a
+//! wired bus, or internal pull-ups for a probe with the pins unconnected.
 //!
 //! ```ignore
 //! let mut i2c = hal::i2c::I2c::new_blocking(
-//!     p.I2C1, p.PB6, p.PB7, hal::i2c::Config::default(),
+//!     p.I2C1, p.PB6, p.PB7, hal::i2c::Config {
+//!         pull: hal::gpio::Pull::Up,
+//!         ..Default::default()
+//!     },
 //! );
-//! i2c.blocking_write(0x50, &[0x00])?;
-//! i2c.blocking_read(0x50, &mut buf)?;
+//! let acknowledged = i2c.blocking_probe(0x50)?;
 //! ```
 
 mod dma;
@@ -237,6 +238,15 @@ fn clear_error_flags<T: Instance>() {
 // already generates STOP and arbitration loss has relinquished the bus.
 fn recover<T: Instance>(error: Option<Error>, spin: u32) {
     let r = T::regs();
+    let timeout_config = if error == Some(Error::Timeout) {
+        let config = r.timeout().read().bits();
+        // Temporarily mask timeout sources so they cannot interrupt cleanup.
+        r.timeout()
+            .write(|w| unsafe { w.bits(config & !((1 << 15) | (1 << 31))) });
+        Some(config)
+    } else {
+        None
+    };
     if r.sts().read().busyf().bit_is_set() && error != Some(Error::ArbitrationLost) {
         if error != Some(Error::NoAcknowledge) {
             r.ctrl2().modify(|_, w| w.genstop().set_bit());
@@ -249,10 +259,27 @@ fn recover<T: Instance>(error: Option<Error>, spin: u32) {
     }
     r.clr().write(|w| w.stopc().set_bit());
     clear_error_flags::<T>();
+    if error == Some(Error::Timeout) {
+        // A clock timeout can leave the controller busy after GENSTOP. Reset
+        // its transaction state while releasing both open-drain lines.
+        r.ctrl1().modify(|_, w| w.i2cen().disable());
+        r.ctrl2().reset();
+        r.ctrl1().modify(|_, w| w.i2cen().enable());
+        r.clr().write(|w| w.stopc().set_bit());
+        clear_error_flags::<T>();
+        for _ in 0..spin.min(1 << 16) {
+            if r.sts().read().busyf().bit_is_clear() {
+                break;
+            }
+        }
+    }
     if r.sts().read().busyf().bit_is_clear() {
         // The vendor middleware flushes a partially filled transmit register
         // after an aborted operation. TDBE is set by writing a one.
         r.sts().modify(|_, w| w.tdbe().set_bit());
+    }
+    if let Some(config) = timeout_config {
+        r.timeout().write(|w| unsafe { w.bits(config) });
     }
 }
 
@@ -448,6 +475,7 @@ pub struct I2c<'d, T: Instance> {
     _scl: Peri<'d, crate::gpio::AnyPin>,
     _sda: Peri<'d, crate::gpio::AnyPin>,
     spin: u32,
+    last_pec_value: u8,
 }
 
 // Loop-count bound for flag waits: each iteration is a register read plus
@@ -477,6 +505,7 @@ impl<'d, T: Instance> I2c<'d, T> {
             _scl: scl_pin.unwrap(),
             _sda: sda_pin.unwrap(),
             spin: DEFAULT_SPIN,
+            last_pec_value: 0,
         }
     }
 
@@ -523,7 +552,7 @@ impl<'d, T: Instance> I2c<'d, T> {
 
     /// Blocking write to a 10-bit-addressed slave (CTRL2.ADDR10 = 1; the
     /// hardware sends the 11110 A9 A8 W header plus the A7..A0 byte).
-    /// Compile-validated only (no 10-bit device on the evb).
+    /// Successful transfers still need validation with a 10-bit target.
     pub fn blocking_write_10bit(&mut self, addr10: u16, bytes: &[u8]) -> Result<(), Error> {
         blocking_transaction::<T>(
             SlaveAddr::Addr10(addr10),
@@ -534,7 +563,8 @@ impl<'d, T: Instance> I2c<'d, T> {
 
     /// Blocking read from a 10-bit-addressed slave (RM 11 figure 11-9,
     /// READH10 = 0): address-only write phase, then a repeated START
-    /// re-sending the header byte with r = 1. Compile-validated only.
+    /// re-sending the header byte with r = 1. Successful transfers still
+    /// need validation with a 10-bit target.
     pub fn blocking_read_10bit(&mut self, addr10: u16, buf: &mut [u8]) -> Result<(), Error> {
         blocking_transaction::<T>(
             SlaveAddr::Addr10(addr10),
@@ -545,8 +575,9 @@ impl<'d, T: Instance> I2c<'d, T> {
 
     /// SMBus master write with PEC (RM 11.4.6, figure 11-14): enables PECEN,
     /// programs CNT = len+1 with PECTEN; the hardware appends the PEC byte
-    /// (CRC-8 over address + data) after the data automatically. Check the
-    /// result with [`I2c::pec_error`]. len + 1 must not exceed 255.
+    /// (CRC-8 over address + data) after the data automatically. The captured
+    /// value is available through [`I2c::last_pec_value`]. len + 1 must not
+    /// exceed 255.
     pub fn blocking_smbus_write_pec(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Error> {
         if bytes.is_empty() || bytes.len() + 1 > 255 {
             return Err(Error::Overrun);
@@ -574,10 +605,14 @@ impl<'d, T: Instance> I2c<'d, T> {
         })();
         if let Err(error) = res {
             recover::<T>(Some(error), self.spin);
+        } else {
+            // I2CEN = 0 resets PECVAL, so preserve the result before disabling PEC.
+            self.last_pec_value = self.pec_value();
         }
+        let pec_error = res.is_ok() && self.pec_error();
         self.set_pec_enabled(false);
         res?;
-        if self.pec_error() {
+        if pec_error {
             Err(Error::Bus)
         } else {
             Ok(())
@@ -616,10 +651,14 @@ impl<'d, T: Instance> I2c<'d, T> {
         })();
         if let Err(error) = res {
             recover::<T>(Some(error), self.spin);
+        } else {
+            // I2CEN = 0 resets PECVAL, so preserve the result before disabling PEC.
+            self.last_pec_value = self.pec_value();
         }
+        let pec_error = res.is_ok() && self.pec_error();
         self.set_pec_enabled(false);
         res?;
-        if self.pec_error() {
+        if pec_error {
             Err(Error::Bus)
         } else {
             Ok(())
@@ -647,6 +686,11 @@ impl<'d, T: Instance> I2c<'d, T> {
         T::regs().pec().read().pecval().bits()
     }
 
+    /// PEC value captured after the most recent completed SMBus transfer.
+    pub fn last_pec_value(&self) -> u8 {
+        self.last_pec_value
+    }
+
     /// PEC receive error flag (STS.PECERR; cleared by this call).
     pub fn pec_error(&self) -> bool {
         let r = T::regs();
@@ -661,7 +705,7 @@ impl<'d, T: Instance> I2c<'d, T> {
     /// `to_ticks` = TOTIME (timeout = (TOTIME+1) x 2048 x Ti2c in low mode /
     /// (TOTIME+1) x 4 x Ti2c in high mode), `detect_high` selects the high
     /// level mode (TOMODE), `ext_ticks` = EXTTIME for the cumulative
-    /// clock-low-extend timeout (0 disables EXTEN). Compile-validated only.
+    /// clock-low-extend timeout (0 disables EXTEN).
     pub fn configure_smbus_timeout(&mut self, to_ticks: u16, detect_high: bool, ext_ticks: u16) {
         T::regs().timeout().write(|w| unsafe {
             w.totime().bits(to_ticks & 0x0FFF);

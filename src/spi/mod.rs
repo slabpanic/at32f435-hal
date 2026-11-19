@@ -29,25 +29,23 @@
 //!
 //! ```ignore
 //! let mut spi = hal::spi::Spi::new_blocking(
-//!     p.SPI2, p.PB13, p.PB14, p.PB15, hal::spi::Config::default(),
+//!     p.SPI1, p.PA5, p.PA6, p.PA7, hal::spi::Config::default(),
 //! );
-//! spi.write(&[0x9F])?;
-//! let mut id = [0u8; 3];
-//! spi.read(&mut id)?;
-//! // CS: drive the CS GPIO low around the transfer (application-owned)
+//! spi.blocking_write(&[0xA5, 0x5A])?;
 //! ```
 //!
-//! DMA example (W25Q flash on SPI2):
+//! DMA example:
 //! ```ignore
 //! bind_interrupts!(struct Irqs {
-//!     DMA1_CH4 => hal::dma::InterruptHandler<hal::peripherals::DMA1_CH4>;
-//!     DMA1_CH5 => hal::dma::InterruptHandler<hal::peripherals::DMA1_CH5>;
+//!     DMA1_CHANNEL4 => hal::dma::InterruptHandler<hal::peripherals::DMA1_CH4>;
+//!     DMA1_CHANNEL5 => hal::dma::InterruptHandler<hal::peripherals::DMA1_CH5>;
 //! });
 //! let mut spi = hal::spi::SpiDma::new(
-//!     p.SPI2, p.PB13, p.PB14, p.PB15,
+//!     p.SPI1, p.PA5, p.PA6, p.PA7,
 //!     p.DMA1_CH5, p.DMA1_CH4, hal::spi::Config::default(),
-//! ).unwrap();
-//! spi.transfer(&mut rx, &tx).await?;
+//! );
+//! // SAFETY: tx is in DMA-accessible memory and remains valid until completion.
+//! unsafe { spi.write(&tx).await? };
 //! ```
 
 mod dma;

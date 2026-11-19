@@ -17,7 +17,8 @@ cargo run --locked --release -p at32f435cgt7-examples --bin blink
 ```
 
 The runner flashes the board and streams RTT logs. The examples assume an 8 MHz
-crystal and 384 KiB of SRAM.
+crystal and 384 KiB of SRAM. The basic SPI and I2C examples run with their
+bus pins unconnected. See the board guide for optional loopback wiring.
 
 - [Blink source](examples/at32f435cgt7/src/bin/blink.rs)
 - [Board setup and examples](examples/at32f435cgt7/README.md)
@@ -43,8 +44,9 @@ The board results below apply to the listed paths on the AT32F435CGT7 EVB.
 | GPIO and EXTI | Digital I/O, alternate functions, async edge waits | GPIO blink and mode switching exercised |
 | DMA and EDMA | DMAMUX, memory copies, peripheral transfers | Memory copies, peripheral DMA and UART DMA cancellation exercised |
 | USART and CAN | Blocking and interrupt-driven I/O, USART DMA and RS-485, CAN filters | USART DMA TX and RS-485 DE, CAN internal loopback |
-| SPI and I2S | Blocking SPI, DMA, hardware chip select and CRC, I2S including full duplex | SPI flash JEDEC reads over DMA and I2S master clocks |
-| I2C | Blocking 7-/10-bit master, SMBus PEC, short 7-bit DMA transfers | Empty-bus scan |
+| SPI | Blocking and DMA master, hardware chip select and CRC | Prior board checks exercised blocking and DMA transfers, hardware chip select and CRC |
+| I2S | Blocking master and slave, full duplex, DMA setup | Master clocks exercised |
+| I2C | Blocking 7-/10-bit master with reload, SMBus PEC, 7-bit DMA | Empty-bus scan. Target checks exercised DMA writes, blocking reload and repeated START, PEC generation and mismatch detection, and timeout recovery |
 | Timers and analog | PWM, complementary PWM, capture, one-pulse, QEI, ADC and DAC | Timer capture and brake, ADC scan/DMA, DAC-to-ADC loopback |
 | USB OTG FS | Embassy device and host support | CDC echo and host startup exercised |
 | Flash, watchdogs and RTC | Main flash, option-byte access, WDT, WWDT, ERTC | Main-flash scratch sector, watchdogs, RTC calendar and alarm |
@@ -68,7 +70,7 @@ With `embassy` enabled, select exactly one time driver. To use TMR2, set
 
 ## TODO
 
-- Validate I2C DMA, repeated START, 10-bit addressing and SMBus PEC with connected devices.
+- Validate I2C DMA receive, successful 10-bit transfers and receipt of valid SMBus PEC with suitable targets.
 - Verify USB host enumeration and bulk transfers, USART DMA reception and flow control, and I2S full-duplex audio with external hardware.
 - Test deep-sleep wakeup in low-power LDO mode and validate ACC calibration against USB SOF.
 - Add drivers for SDIO, QSPI, XMC and DVP.

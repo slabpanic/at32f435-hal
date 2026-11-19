@@ -1,7 +1,8 @@
 //! I2C: bus probe on I2C1 (SCL=PB6, SDA=PB7 @ 100 kHz).
 //!
-//! Connect a 7-bit peripheral to PB6/PB7 with external pull-ups. The scan
-//! sends an address-only write so it does not read or program device data.
+//! The internal pull-ups allow a scan with both pins unconnected. An empty
+//! scan is expected on an idle bus with no targets. Each probe sends only a
+//! 7-bit address in the write direction. Use external pull-ups for a wired bus.
 
 #![no_std]
 #![no_main]

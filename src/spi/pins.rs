@@ -4,23 +4,23 @@ crate::pin_trait_impl!(crate::spi::SckPin, SPI1, PA5, 5); // [V]
 crate::pin_trait_impl!(crate::spi::SckPin, SPI1, PB3, 5); // [I]
 crate::pin_trait_impl!(crate::spi::MisoPin, SPI1, PA6, 5); // [I]
 crate::pin_trait_impl!(crate::spi::MisoPin, SPI1, PB4, 5); // [I]
-crate::pin_trait_impl!(crate::spi::MosiPin, SPI1, PA7, 5); // [V] spi_fls examples
+crate::pin_trait_impl!(crate::spi::MosiPin, SPI1, PA7, 5); // [V]
 crate::pin_trait_impl!(crate::spi::MosiPin, SPI1, PB5, 5); // [I]
 crate::pin_trait_impl!(crate::spi::CsPin, SPI1, PA4, 5); // [I]
 crate::pin_trait_impl!(crate::spi::CsPin, SPI1, PA15, 5); // [I]
 
-crate::pin_trait_impl!(crate::spi::SckPin, SPI2, PB13, 5); // [V] evb W25Q64 flash
+crate::pin_trait_impl!(crate::spi::SckPin, SPI2, PB13, 5); // [V]
 crate::pin_trait_impl!(crate::spi::SckPin, SPI2, PB1, 6); // [I]
 crate::pin_trait_impl!(crate::spi::SckPin, SPI2, PC7, 5); // [I]
 crate::pin_trait_impl!(crate::spi::SckPin, SPI2, PD3, 5); // [I]
-crate::pin_trait_impl!(crate::spi::MisoPin, SPI2, PB14, 5); // [V] evb W25Q64 flash
+crate::pin_trait_impl!(crate::spi::MisoPin, SPI2, PB14, 5); // [V]
 crate::pin_trait_impl!(crate::spi::MisoPin, SPI2, PC2, 5); // [I]
 crate::pin_trait_impl!(crate::spi::MisoPin, SPI2, PD3, 6); // [I]
-crate::pin_trait_impl!(crate::spi::MosiPin, SPI2, PB15, 5); // [V] evb W25Q64 flash
+crate::pin_trait_impl!(crate::spi::MosiPin, SPI2, PB15, 5); // [V]
 crate::pin_trait_impl!(crate::spi::MosiPin, SPI2, PC3, 5); // [I]
 crate::pin_trait_impl!(crate::spi::MosiPin, SPI2, PC1, 7); // [I]
 crate::pin_trait_impl!(crate::spi::CsPin, SPI2, PB9, 5); // [I]
-crate::pin_trait_impl!(crate::spi::CsPin, SPI2, PB12, 5); // [V] evb W25Q64 flash CS
+crate::pin_trait_impl!(crate::spi::CsPin, SPI2, PB12, 5); // [V]
 crate::pin_trait_impl!(crate::spi::CsPin, SPI2, PD0, 7); // [I]
 crate::pin_trait_impl!(crate::spi::CsPin, SPI2, PD1, 7); // [I]
 
