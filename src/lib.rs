@@ -39,7 +39,7 @@
 //! (the application supplies memory.x and links cortex-m-rt's link.x).
 //!
 //! ## Key differences from going HAL-less
-//! - `at32f4xx_pac::Peripherals::take()/steal()` is never touched: HAL peripheral
+//! - `pac::Peripherals::take()/steal()` is never touched: HAL peripheral
 //!   singletons are zero-sized marker types and registers are accessed via the
 //!   `Periph::PTR` pointer, avoiding the PAC pitfall where mixing take/steal makes
 //!   `take()` stop working.
@@ -66,7 +66,7 @@ compile_error!(
     "the embassy feature requires a time driver: enable time-driver-systick or time-driver-tim2"
 );
 
-pub use at32f4xx_pac::at32f435 as pac;
+pub use at32_pac as pac;
 pub use embassy_hal_internal;
 pub use embassy_hal_internal::{impl_peripheral, Peri, PeripheralType};
 

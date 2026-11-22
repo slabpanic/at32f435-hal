@@ -331,7 +331,7 @@ pub(crate) fn restore_after_deepsleep(source: Sysclk) {
 /// enable field, reset register, reset field, frequency source).
 ///
 /// All field/register names are verified CRM register fields from
-/// at32f4xx-pac 0.4; timer-class peripherals take their frequency from
+/// at32-pac; timer-class peripherals take their frequency from
 /// `pclk1_tim`/`pclk2_tim` (2x the APB clock when the APB divider is > 1).
 macro_rules! impl_rcc {
     ($($peri:ident => ($en_reg:ident, $en_field:ident, $rst_reg:ident, $rst_field:ident, $freq:ident)),* $(,)?) => {

@@ -11,7 +11,7 @@ categories = ["embedded", "hardware-support", "no-std"]
 rust-version = "1.87"
 
 [dependencies]
-at32f4xx-pac = { version = "0.4", default-features = false, features = ["at32f435", "critical-section"] }
+at32-pac = { version = "0.1", default-features = false, features = ["at32f435", "critical-section"] }
 embassy-hal-internal = "0.5"
 embassy-sync = "0.8"
 embassy-usb-driver = { version = "0.2", optional = true }
@@ -33,7 +33,7 @@ default = ["embassy", "rt", "exti", "time-driver-systick"]
 # embassy integration: time driver + queues (the app brings embassy-time itself and picks a generic-queue-N)
 embassy = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils"]
 # rt: cortex-m-rt (entry/vector table + #[interrupt]/#[exception] macros)
-rt = ["dep:cortex-m-rt", "at32f4xx-pac/rt"]
+rt = ["dep:cortex-m-rt", "at32-pac/rt"]
 # exti: built-in EXINT driver; the 7 EXINT vector handlers are owned by the HAL; disable it to bind_interrupts yourself
 exti = ["rt"]
 # usb: OTGFS1/OTGFS2 device + host drivers (the embassy-usb-driver stack comes from embassy-usb-synopsys-otg)

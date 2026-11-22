@@ -12,10 +12,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "at32-pac"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58480d83dae444b2efad757bffbf62103e6bb05f3110024923fe96c933b4d5c2"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "critical-section",
+ "vcell",
+]
+
+[[package]]
 name = "at32f435-hal"
 version = "0.1.0"
 dependencies = [
- "at32f4xx-pac",
+ "at32-pac",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
@@ -45,18 +57,6 @@ dependencies = [
  "embedded-hal 1.0.0",
  "panic-probe",
  "static_cell",
-]
-
-[[package]]
-name = "at32f4xx-pac"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03ebd4380912cf38a99b106e620405f410a51a303aa477c743a626ff1931022f"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "critical-section",
- "vcell",
 ]
 
 [[package]]

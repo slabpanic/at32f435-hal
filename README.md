@@ -6,10 +6,13 @@ the driver conventions of [ch32-hal](https://github.com/ch32-rs/ch32-hal).
 
 The project is under active development.
 
+The HAL uses `at32-pac` 0.1 with the `at32f435` feature and exposes its
+register API through `at32f435_hal::pac`. [PAC on crates.io](https://crates.io/crates/at32-pac)
+
 ## Quick start
 
 Install Rust 1.87 or newer and [probe-rs](https://probe.rs/) to run the board examples.
-From the repository root:
+Run these commands from the HAL root.
 
 ```sh
 rustup target add thumbv7em-none-eabihf
